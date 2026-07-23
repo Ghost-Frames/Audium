@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Audium}",
+            "name": "Debug Audium",
+            "target": "Audium",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Audium"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Audium}",
+            "name": "Release Audium",
+            "target": "Audium",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Audium"
+        }
+    ]
+}
