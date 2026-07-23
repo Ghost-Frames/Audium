@@ -51,7 +51,6 @@ struct ContentView: View {
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.background)
-        .onAppear { seedWaveformTestIfNeeded() }
     }
 
     private func handleDrop(providers: [NSItemProvider]) -> Bool {
@@ -134,23 +133,6 @@ struct ContentView: View {
         transcriptionStartedAt = nil
     }
 
-    // TEMP manual test hook — see conversation, will be removed after verification (spec §7).
-    // Seeds waveform+playback+transcript state directly from a local file, bypassing every
-    // TranscriptionProvider — used to verify the waveform/playback/sync feature itself on Zeus
-    // (Intel: WhisperKit SIGSEGVs; cloud providers need a Keychain password prompt that blocks
-    // synthetic input) without depending on either.
-    private func seedWaveformTestIfNeeded() {
-        guard let path = ProcessInfo.processInfo.environment["AUDIUM_TEST_WAVEFORM_SEED"] else { return }
-        let url = URL(fileURLWithPath: path)
-        sourceAudioURL = url
-        playback.load(url: url)
-        segments = [
-            TranscriptSegment(text: "This is the first sentence for testing the waveform.", start: 0.0, end: 2.8, speaker: "Speaker 1"),
-            TranscriptSegment(text: "Here comes a second sentence with different words.", start: 2.8, end: 5.6, speaker: "Speaker 1"),
-            TranscriptSegment(text: "And now a third and final sentence to wrap things up.", start: 5.6, end: 8.4, speaker: "Speaker 1"),
-        ]
-        status = "\(segments.count) segments"
-    }
 }
 
 /// Real waveform + playback (spec §2). Bar-style amplitude visualizer — a row of vertical bars
@@ -337,8 +319,8 @@ private struct TranscriptPanel: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if segments.isEmpty {
                 Spacer()
-                Text("No transcript yet")
-                    .foregroundStyle(.secondary)
+                Text(status.isEmpty ? "No transcript yet" : status)
+                    .foregroundStyle(status.hasPrefix("Transcription failed") ? .red : .secondary)
                 Spacer()
             } else {
                 let currentID = currentSegmentID

@@ -281,18 +281,4 @@ enum KeychainStore {
         }
         return String(data: data, encoding: .utf8)
     }
-
-    // DEV-ONLY TEST ESCAPE HATCH — not a feature, do not build UI around this.
-    // The GUI Keychain-write dialog is broken/being investigated separately, which blocks
-    // manually exercising cloud providers end-to-end. Until that's fixed, setting
-    // AUDIUM_GEMINI_KEY_OVERRIDE / AUDIUM_OPENAI_KEY_OVERRIDE in the environment lets a key be
-    // supplied directly, bypassing Keychain reads entirely.
-    // Never set in shipped builds/CI, never written back to Keychain, and inert unless the env
-    // var is explicitly present.
-    static func loadForTesting(for provider: Provider, envOverride: String) throws -> String? {
-        if let override = ProcessInfo.processInfo.environment[envOverride], !override.isEmpty {
-            return override
-        }
-        return try load(for: provider)
-    }
 }

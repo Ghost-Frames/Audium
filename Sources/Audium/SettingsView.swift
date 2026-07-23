@@ -72,6 +72,7 @@ struct SettingsView: View {
             PanelTitle("Default Transcription Provider")
             Picker("", selection: $defaultTranscriptionProvider) {
                 Text("WhisperKit (local)").tag(TranscriptionProviderKind.whisperKit)
+                    .disabled(!HardwareCapability.hasNeuralEngine)
                 Text("Gemini (cloud)").tag(TranscriptionProviderKind.gemini)
                 Text("OpenAI (cloud)").tag(TranscriptionProviderKind.openAI)
             }
@@ -80,10 +81,23 @@ struct SettingsView: View {
             .onChange(of: defaultTranscriptionProvider) { _, newValue in
                 TranscriptionSettings.defaultProvider = newValue
             }
+            // Spec §5, Known Issues: WhisperKit SIGSEGVs on Intel before compute-unit dispatch
+            // can even route around it — disabling the option above isn't enough on its own,
+            // since it can't undo a WhisperKit default persisted before this check existed.
+            if !HardwareCapability.hasNeuralEngine {
+                Text("WhisperKit is unsupported on this Mac — an upstream crash affects Intel Macs without a Neural Engine (see docs/spec.md Known Issues). Use Gemini or OpenAI instead.")
+                    .font(.caption2)
+                    .foregroundStyle(Theme.accent)
+            }
         }
         .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassPanel()
+        .onAppear {
+            if defaultTranscriptionProvider == .whisperKit && !HardwareCapability.hasNeuralEngine {
+                defaultTranscriptionProvider = .gemini
+            }
+        }
     }
 
     private var whisperModelSection: some View {

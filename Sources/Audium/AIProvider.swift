@@ -67,7 +67,7 @@ struct GeminiProvider: AIProvider {
     }
 
     private func completeInner(messages: [Message], model: String) async throws -> String {
-        guard let apiKey = try KeychainStore.loadForTesting(for: .gemini, envOverride: "AUDIUM_GEMINI_KEY_OVERRIDE"), !apiKey.isEmpty else {
+        guard let apiKey = try KeychainStore.load(for: .gemini), !apiKey.isEmpty else {
             throw AIProviderError.missingAPIKey(.gemini)
         }
 
@@ -130,7 +130,7 @@ struct OpenAIProvider: AIProvider {
     }
 
     private func completeInner(messages: [Message], model: String) async throws -> String {
-        guard let apiKey = try KeychainStore.loadForTesting(for: .openai, envOverride: "AUDIUM_OPENAI_KEY_OVERRIDE"), !apiKey.isEmpty else {
+        guard let apiKey = try KeychainStore.load(for: .openai), !apiKey.isEmpty else {
             throw AIProviderError.missingAPIKey(.openai)
         }
 

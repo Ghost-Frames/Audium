@@ -37,6 +37,15 @@ struct WhisperKitProvider: TranscriptionProvider {
     var onStatus: TranscriptionStatusHandler?
 
     func transcribe(audio: URL) async throws -> Transcript {
+        // Safety net (spec §5, Known Issues): WhisperKit SIGSEGVs on Intel before compute-unit
+        // dispatch, so this can't be caught with a do/catch — it must never be reached at all.
+        // Guarded here rather than in each caller since every path that can construct a
+        // WhisperKitProvider (the real GUI's default-provider switch, and the dev test hooks in
+        // AudiumApp.swift that build one directly) routes through this one function.
+        guard HardwareCapability.hasNeuralEngine else {
+            AudiumLog.transcription.error("WhisperKit blocked: no Neural Engine on this Mac (known SIGSEGV, spec §5)")
+            throw TranscriptionError.unsupportedOnThisHardware
+        }
         AudiumLog.transcription.info("WhisperKit transcription started: \(audio.lastPathComponent, privacy: .public)")
         do {
             let variant = WhisperModelSettings.selectedVariant ?? WhisperKit.recommendedModels().default
@@ -89,6 +98,7 @@ enum TranscriptionError: LocalizedError {
     case unsupportedAudioFormat(String)
     case httpError(status: Int, body: String)
     case emptyResponse
+    case unsupportedOnThisHardware
 
     var errorDescription: String? {
         switch self {
@@ -100,6 +110,8 @@ enum TranscriptionError: LocalizedError {
             return "HTTP \(status): \(body)"
         case .emptyResponse:
             return "Empty transcription response"
+        case .unsupportedOnThisHardware:
+            return "WhisperKit isn't supported on this Mac yet — an upstream crash affects Intel Macs without a Neural Engine (see docs/spec.md Known Issues). Switch to Gemini or OpenAI in Settings."
         }
     }
 }
@@ -147,7 +159,7 @@ struct GeminiTranscriptionProvider: TranscriptionProvider {
         AudiumLog.transcription.info("Gemini transcription started: \(audio.lastPathComponent, privacy: .public)")
         onStatus?("Transcribing via Gemini…", nil)
         do {
-            guard let apiKey = try KeychainStore.loadForTesting(for: .gemini, envOverride: "AUDIUM_GEMINI_KEY_OVERRIDE"), !apiKey.isEmpty else {
+            guard let apiKey = try KeychainStore.load(for: .gemini), !apiKey.isEmpty else {
                 throw TranscriptionError.missingAPIKey(.gemini)
             }
             guard let mimeType = Self.mimeTypes[audio.pathExtension.lowercased()] else {
@@ -227,7 +239,7 @@ struct OpenAIWhisperAPIProvider: TranscriptionProvider {
     }
 
     private func transcribeInner(audio: URL) async throws -> Transcript {
-        guard let apiKey = try KeychainStore.loadForTesting(for: .openai, envOverride: "AUDIUM_OPENAI_KEY_OVERRIDE"), !apiKey.isEmpty else {
+        guard let apiKey = try KeychainStore.load(for: .openai), !apiKey.isEmpty else {
             throw TranscriptionError.missingAPIKey(.openai)
         }
 

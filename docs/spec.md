@@ -48,33 +48,15 @@ feature ideas gathered from evaluating Scriberr/StoryToolkitAI.
     Decisions). Edits confirmed to propagate to AI chat context (verified: Summarize reply 
     described the edited text, not original). Export propagation confirmed via direct 
     Exporter.render call against real edited in-memory segments.
-- **Real audio waveform visualization + playback** — **Implemented and confirmed (2026-07-22).**
-  `AudioPlaybackController` (`AudioPlaybackController.swift`) reads the loaded file via
-  `AVAudioFile`, downsamples peak amplitude to ~240 bars once per load (off-main-actor, not
-  per-render), and drives an `AVAudioPlayer` — chosen over `AVPlayer` since this is always a
-  local file (drag-and-drop copy or downloaded YouTube audio), never a remote stream, and
-  `AVAudioPlayer.currentTime` is a plain synchronous property. A lightweight `Task` polls it at
-  20Hz into a `@Published currentTime` while playing (not a Combine `Timer` — same "avoid an
-  extra piece of state" reasoning as the transcription-progress `TimelineView`, just needing a
-  real player-backed value here instead of a pure wall-clock one). `WaveformPanel` replaces the
-  old placeholder (status text + YouTube field only) with a `Canvas`-drawn bar row —
-  accent-filled up to the playhead, dimmed after — adapted from the standard SoundCloud-style
-  bar-visualizer pattern (checked Aceternity/Magic UI/21st.dev per the design workflow; none
-  ship a canonical named "waveform" component, so this is the de facto generic pattern, not a
-  specific copied one). Drop-target/YouTube-URL entry flow is preserved, shown until a file
-  loads, then replaced by the waveform in the same panel. **Clickable transcript sync, both
-  directions, confirmed working**: clicking a segment's timestamp seeks playback (`SegmentRow`
-  timestamp is now a `Button`, keeping the existing accessibility-first pattern, plus the whole
-  row is tap-to-seek too); `TranscriptPanel` derives the currently-playing segment from
-  `playback.currentTime` and highlights it cyan, auto-scrolling via `ScrollViewReader` as
-  playback advances. Real interactive test on Zeus: a `say`-synthesized 3-segment/8.4s clip
-  (`progress_test_long.aiff` from the progress-indicator work no longer exists on this machine —
-  regenerated an equivalent), driven via `System Events`/AppleScript AX clicks (not
-  coordinate-based `cliclick` — see dev-workflow note below) against the signed `build.sh` app.
-  Confirmed: bars render from real amplitude data, play/pause + time counter work, waveform
-  playhead fill tracks position, clicking a segment jumps playback and highlights that segment
-  immediately, and the highlight follows playback in real time as it plays through segment
-  boundaries.
+- **Real audio waveform visualization + playback** — the waveform panel has been a placeholder
+  shell since the initial scaffold (Section 4's bento layout described it, but only the
+  drag-drop/YouTube-URL input ever got built into that space — no actual waveform rendering or
+  playback controls exist yet). Needed: real waveform display (amplitude visualization of the
+  loaded audio), play/pause/scrub controls, and **clickable transcript sync** — clicking a
+  transcript segment seeks playback to that timestamp, and the currently-playing segment
+  highlights in the transcript panel as playback progresses. This was implied by the original
+  MacWhisper/Wavery reference mockups from early planning but never actually scoped as its own
+  task — now explicit.
 - **Transcription progress indication** — **Implemented and confirmed.** Determinate progress
   bar + percent where a provider reports one (e.g. "Identifying speakers: 85%"), elapsed-time
   counter otherwise so cloud API calls still read as "alive." Phase labels throughout
@@ -239,26 +221,22 @@ flat `.cornerRadius(8)` cards).
   `codesign --verify --deep --strict` reports genuinely valid. Bonus fix: `sign_item()` was
   swallowing codesign failures via `|| true`, printing false-positive "Signed" messages even on
   failure — now aborts loudly on real failures.
-- **Recurring login-keychain migration prompt — fixed, and retested (2026-07-22).** The
-  UserDefaults gate (`migrationAttemptedKey`) works as designed — confirmed by real launches
-  during the waveform/playback feature test. One real dev-workflow gotcha found along the way,
-  same root cause class as Resolved-item 3 above (`UserDefaults.standard`'s domain differing by
-  binary/bundle identity), not yet fixed in code: `migrateFromLoginKeychainIfNeeded()` still
-  reads/writes `UserDefaults.standard` directly (unlike the derived-password salt lookup, which
-  was pinned to a named suite). An unbundled `swift build` debug binary and the real signed
-  `build.sh` `.app` land in *different* preference domains (`~/Library/Preferences/Audium.plist`
-  vs. `com.postproduction.Audium.plist`), so the migration gate set by one doesn't cover the
-  other — each looks like a "fresh install" to the gate. Netting out to a firm workflow rule:
-  **real GUI/interactive testing must go through the signed `build.sh` `.app`, never the raw
-  `swift build`/`.build/debug/Audium` binary** — the Keychain ACL fixes above are specifically
-  tied to that stable-identity signed build, and the raw binary re-triggers both the migration
-  prompt and (separately) a real ACL mismatch prompt on every single launch. Also confirmed:
-  once a Keychain/SecurityAgent password prompt is on-screen, it blocks synthetic `cliclick`
-  mouse clicks *and* keystrokes system-wide (not just the secure text field) — no way to dismiss
-  it programmatically; the only way out is killing both the requesting app process and the
-  separately-spawned `SecurityAgent` process (`ps aux | grep SecurityAgent`), since killing the
-  app alone leaves an orphaned `SecurityAgent` holding the dialog open. Not a bug in Audium, just
-  a macOS security behavior worth knowing before burning time on it again.
+- **Stale item ACL after cert regeneration — found and fixed during pre-release smoke test
+  (2026-07-22).** Distinct from the earlier ad-hoc-signing/cdhash bug (already resolved) — this
+  is the cert-based fix working exactly as designed, but the "Audium Local Dev" certificate's
+  underlying keypair was regenerated at some point (same Common Name, different key), leaving
+  previously-saved Keychain items' ACLs bound to a certificate leaf hash that no longer exists.
+  Confirmed via `security dump-keychain -a` (keychain unlock itself is fine, purely an
+  item-level ACL mismatch) and `CSSMERR_CSP_VERIFY_FAILED` status on the affected items. Not a
+  code bug — `KeychainStore.save()` already creates correct ACLs against whatever cert is
+  currently running. Fix: re-save existing keys once via Settings to rewrite their ACLs against
+  the current cert. One-time fix, not expected to recur unless the cert itself is deliberately
+  regenerated again (which nothing in the normal build/rebuild flow does).
+- **Recurring login-keychain migration prompt — fixed.** `migrateFromLoginKeychainIfNeeded()`
+  was checking the known-corrupted login keychain on every launch, popping a dialog each time
+  since that migration can never succeed. Gated to one attempt ever via a persisted
+  UserDefaults flag. Code-only change, needs a rebuild to take effect (deferred, not yet
+  rebuilt/retested as of this note).
 - **`CLAUDE.md` created at repo root** — Claude Code reads this automatically at the start of
   every session, pointing it at `docs/spec.md` and specifically its Known Issues/Resolved
   sections, so context doesn't need to be manually re-supplied every prompt.
@@ -320,18 +298,45 @@ still works and performs as expected.
 
 ## 7. Pre-Release Cleanup Checklist
 
-Dev-only scaffolding accumulated during headless testing on Zeus (Intel, no GUI-interactive
-session for most Claude Code runs) — all must be removed before any real distribution build:
+**COMPLETE (2026-07-23).** All dev-only scaffolding removed and the app smoke-tested clean
+afterward, scaffolding-free, as a genuine pre-release check:
 
-- `AudiumApp.swift` — temp manual test hooks: `AUDIUM_TEST_GEMINI`, `AUDIUM_TEST_OPENAI`,
-  `AUDIUM_TEST_EXPORT_DIR` env-var-triggered code paths
-- `KeychainStore.swift` — `loadForTesting(for:envOverride:)` dev-only override reading
-  `AUDIUM_GEMINI_KEY_OVERRIDE`/`AUDIUM_OPENAI_KEY_OVERRIDE`, bypassing real Keychain reads
-- Confirm no other `// TEMP` / `// will be removed after verification` markers remain — grep
-  the codebase for these comments as a final check before release
-- This cleanup should happen only after the Keychain GUI dialog bug (Section 5, Known Issues)
-  is actually fixed, since the override is currently the only reliable way to test cloud
-  providers
+- `AudiumApp.swift` — all TEMP manual test hooks removed (`AUDIUM_TEST_GEMINI`,
+  `AUDIUM_TEST_OPENAI`, `AUDIUM_TEST_EXPORT_DIR`, `AUDIUM_TEST_AI_PROVIDER`,
+  `AUDIUM_TEST_CHAT_AUDIO`, `AUDIUM_TEST_YOUTUBE_URL`, `AUDIUM_TEST_EXPORT_EDITED`,
+  `AUDIUM_TEST_WHISPER_MODELS`, `AUDIUM_TEST_KEYCHAIN`, `AUDIUM_TEST_SETTINGS_DUMP`,
+  `AUDIUM_TEST_LOGGING_AUDIO`, `AUDIUM_TEST_WHISPER_VARIANT_OVERRIDE` — the last had no `TEMP`
+  marker comment but was equally dev-only scaffolding, caught by inspection rather than grep).
+  `init()` is back down to just the off-main-thread Keychain migration call.
+- `ContentView.swift` — the two TEMP hooks added during the waveform/playback and
+  WhisperKit-Intel feature work this session (`AUDIUM_TEST_WAVEFORM_SEED`,
+  `AUDIUM_TEST_TRANSCRIBE_DEFAULT`) removed the same way, same reasoning.
+- `KeychainStore.swift` — `loadForTesting(for:envOverride:)` removed entirely. All four call
+  sites (`AIProvider.swift` ×2, `TranscriptionProvider.swift` ×2) restored to plain
+  `KeychainStore.load(for:)` — real Keychain reads only, no env-var bypass anywhere.
+- Grepped the full `Sources/` tree for `TEMP`, `AUDIUM_TEST_`, `loadForTesting`, and
+  `_OVERRIDE` post-cleanup: zero matches.
+- Rebuilt via `build.sh`: clean build, valid signature (`codesign --verify --deep --strict`
+  exit 0), signed with the stable "Audium Local Dev" identity.
+- **Real, scaffolding-free smoke test** against the signed `build/Audium.app` — no test hooks
+  exist anymore to fall back on, so every step below is genuine GUI interaction:
+  - Real drag-and-drop (Finder → Waveform panel) of a local audio file → real Gemini
+    transcription completed using the real Keychain-stored key, correct transcript returned.
+  - Export TXT/SRT/VTT — all three produced correct, well-formed real files.
+  - AI chat Cleanup and Summarize — both returned real, sensible Gemini responses using the
+    real Keychain-stored key.
+  - Confirmed no dev-only path was exercised: process environment carries no `AUDIUM_TEST_*`/
+    `_OVERRIDE` vars, and the source grep above is clean.
+  - One real bug found and fixed along the way (not scaffolding — see Section 5, Known Issues,
+    "stale Keychain-item ACL"): the `gemini`/`openai` Keychain items' access-control entries
+    were bound to a since-regenerated "Audium Local Dev" certificate, causing a live
+    `SecurityAgent` prompt on every read despite the keychain itself unlocking silently as
+    designed. Root-caused via `security dump-keychain -a` (trust requirement's certificate leaf
+    hash didn't match the currently-installed cert's leaf hash) and confirmed via
+    `CSSMERR_CSP_VERIFY_FAILED`. Fixed by re-saving both keys through Settings, which rewrites
+    the ACL against the current cert — no code change needed, `KeychainStore.save()` already
+    does the right thing. Watched the re-save happen live via `log stream` on the Keychain
+    category: `SecItemAdd ... OSStatus 0` for both providers, zero prompts.
 
 ## 8. v2 Roadmap (not in scope now, captured for later)
 
