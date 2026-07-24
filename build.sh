@@ -71,6 +71,16 @@ else
     echo "   ⚠️  ffmpeg not found in Resources/bin/"
 fi
 
+# ── 3c. Bundle Skills (AI Chat role presets, spec §8) ────────
+echo "▶ Bundling Skills…"
+SKILLS_SRC="$SCRIPT_DIR/Skills"
+if [ -d "$SKILLS_SRC" ]; then
+    cp -R "$SKILLS_SRC" "$RES_DIR/Skills"
+    echo "   ✅ Skills bundled"
+else
+    echo "   ⚠️  Skills/ not found at repo root"
+fi
+
 # ── 4. Bundle app icon ───────────────────────────────────────
 echo "▶ Bundling app icon…"
 ICON_SRC="$SCRIPT_DIR/Resources/AppIcon.png"

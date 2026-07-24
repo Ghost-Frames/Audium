@@ -142,9 +142,34 @@ struct SettingsView: View {
         .glassPanel()
     }
 
+    /// Distinguishes "never saved a key" (silent blank field, fine) from "Keychain read failed"
+    /// (silent blank field, misleading — see spec §5 "Keychain reset" investigation). The
+    /// previous `try?`-based version couldn't tell these apart, so a stale item ACL (e.g. after
+    /// denying the SecurityAgent prompt, or after a rebuild changes the app's code identity)
+    /// looked identical to "no key saved yet" — no error, just empty fields, with no indication
+    /// that anything needed fixing. Confirmed live: neither "Allow" nor "Always Allow" on that
+    /// prompt is actually completable by a human — it asks for the dedicated Keychain's own
+    /// password, which is a random value derived via HKDF and never surfaced anywhere by design
+    /// (see KeychainStore.derivedPassword) — so Deny is the only button that does anything,
+    /// making the prompt a dead end regardless of which button gets clicked. The real recovery
+    /// path is re-entering and re-saving here: `KeychainStore.save()` does a fresh
+    /// SecItemDelete+SecItemAdd from inside the already-trusted app process, which sets a new
+    /// self-only ACL without ever needing that unsatisfiable prompt.
     private func loadExistingKeys() {
-        geminiKey = (try? KeychainStore.load(for: .gemini)) ?? nil ?? ""
-        openAIKey = (try? KeychainStore.load(for: .openai)) ?? nil ?? ""
+        var readFailed = false
+        do {
+            geminiKey = try KeychainStore.load(for: .gemini) ?? ""
+        } catch {
+            readFailed = true
+        }
+        do {
+            openAIKey = try KeychainStore.load(for: .openai) ?? ""
+        } catch {
+            readFailed = true
+        }
+        if readFailed {
+            status = "Couldn't read saved keys from Keychain (access denied or out of date). Re-enter and Save Keys to fix."
+        }
     }
 
     private func saveKeys() {

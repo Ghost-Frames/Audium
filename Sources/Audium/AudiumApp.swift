@@ -36,5 +36,11 @@ struct AudiumApp: App {
             LogViewerView()
         }
         .defaultSize(width: 640, height: 480)
+
+        Window("About Audium", id: "about") {
+            AboutView()
+        }
+        .defaultSize(width: 320, height: 320)
+        .windowResizability(.contentSize)
     }
 }

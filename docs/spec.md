@@ -338,7 +338,228 @@ afterward, scaffolding-free, as a genuine pre-release check:
     does the right thing. Watched the re-save happen live via `log stream` on the Keychain
     category: `SecItemAdd ... OSStatus 0` for both providers, zero prompts.
 
-## 8. v2 Roadmap (not in scope now, captured for later)
+## 8. v2 Architecture — Story Editor / Paper Edit Tool
+
+**New vision (2026-07-22):** Audium v2 shifts from "load one file, transcribe it" to a
+**project-based story-editing tool** — screen dailies, build transcripts, mark highlights, and
+assemble a paper edit, all without opening Avid/Premiere/Resolve. The paper edit gets brought
+into the real NLE afterward; this tool handles the screening/scripting phase before that.
+
+### Data model — Project
+
+- A **Project** is a folder on disk (not a database) — fits the AE mental model, same spirit as
+  an Avid bin structure. Contains:
+  - **Sub-folders** by scene/day/interview subject (user-organized, not a fixed taxonomy) —
+    each sub-folder holds one or more **Dailies** (source media) and their associated
+    **Transcripts**.
+  - A project-level metadata file (JSON) tracking folder structure, daily↔transcript links,
+    highlights, and paper-edit state.
+- **Daily**: one source media file (video or audio) + its Transcript (segments, speakers,
+  timestamps — reuses existing `Transcript`/`TranscriptSegment` types) + its **Highlights**.
+- **Highlight**: a marked range within a transcript (one or more contiguous segments, or a
+  sub-segment range if word-level precision is ever added) — carries an optional tag/color/note.
+  Not a new copy of the text; a reference into the source transcript, so edits to the original
+  segment propagate to anywhere it's highlighted.
+- **Paper Edit**: an ordered sequence of Highlight references, potentially spanning multiple
+  Dailies/transcripts within a project — the assembled "selects" reel in script form. Reordering
+  is drag-and-drop; each entry still points back to its source Daily/timestamp for traceability
+  when brought into the real NLE later.
+
+### UI implications
+
+- Needs a **project browser** (new UI region — likely a left sidebar, expanding the current
+  bento layout from 3 panels to 4: project tree · media/video panel · transcript panel · AI
+  chat) showing the folder/daily tree, current selection driving what's loaded in the other
+  panels.
+- Transcript panel gains **highlight marking** — select a range, tag it, see highlighted ranges
+  visually distinguished (cyan accent, consistent with existing design language).
+- A separate **Paper Edit view** (new panel, tab, or window) showing the assembled sequence,
+  reorderable, each entry showing source + timestamp + text, playable in order.
+
+### Video playback (upgraded from audio-only)
+
+- Current `AudioPlaybackController` (AVAudioFile/AVAudioPlayer) is audio-only — v2 needs real
+  video preview + scrubbing (user decision: full video preview/scrubbing required, not just
+  audio-sync). Replace/extend with `AVPlayer` + `AVPlayerLayer`/`VideoPlayer` (SwiftUI) for
+  video files; audio-only dailies still use the existing waveform view. Scrubbing, play/pause,
+  and transcript-sync (click-to-seek, playhead-follows-highlight) all carry over from the v1
+  implementation, just need to work against `AVPlayer`'s time-observation API instead of
+  polling `AVAudioPlayer.currentTime`.
+
+### Export additions
+
+- **`.docx` export** — fourth format alongside TXT/SRT/VTT, using the same `Exporter` pattern.
+  Two distinct docx outputs likely needed: (1) a formatted transcript export (readable script
+  format, speaker labels, timestamps), and (2) a **paper edit export** — the assembled
+  highlights in script/screenplay-adjacent formatting, this being the actual deliverable this
+  whole feature exists to produce. `python-docx`-equivalent for Swift: check what's available
+  (likely hand-rolling OOXML via a Swift docx-writing approach, or a small library) — research
+  needed before implementation, don't assume a library exists without checking.
+
+### AI Chat "Roles" (text-based skills as system prompts)
+
+- User decision: **text-based skills only for v2** (not code-driven skills — see below).
+- **Skill sources, now fully imported (2026-07-23) — superseding the earlier ~14-file curated
+  subset:**
+  - `ur-grue/autopunk-media-skills` — **all 394 `SKILL.md` files bundled**, not a curated
+    subset. Mirrored under `Skills/autopunk/<category>/<subcategory>/<skill-slug>.md`, matching
+    the source repo's own `skills/<category>/<subcategory>/<skill-slug>/SKILL.md` layout
+    (flattened by one level — only `SKILL.md`'s content is kept per skill, renamed to
+    `<slug>.md`; the sibling `.evals.json` fixture per skill isn't bundled, the app has no use
+    for it). 21 non-empty categories (a 22nd, `locales`, exists upstream but is currently empty
+    so nothing bundles from it) — see `Skills/THIRD_PARTY_LICENSES.md` for the full category
+    list and license text (MIT, unchanged from the original curation).
+  - `OmkarPalika/filmcraft` — unchanged from the original curation: only the main
+    `skills/filmcraft/SKILL.md` ("standing rules") as `Skills/filmcraft.md`; its `references/`
+    and `directors/` subfolders are still out of scope (dynamic loading is a bigger feature, see
+    the original reasoning below).
+  - Explicitly excluded (code-driven, need Python/tool execution, not static prompts):
+    `nextlevelbuilder/ui-ux-pro-max-skill` and likely others in the `ComposioHQ/
+    awesome-claude-skills` curated list — unchanged, revisit only if a specific
+    editorial-relevant code-driven skill is worth the much bigger investment of giving the app
+    its own tool-execution capability.
+- **Bundle size impact**: `Skills/` is 4.1MB (394 autopunk files + filmcraft.md + the license
+  doc) — negligible against the ~123MB signed `.app` (WhisperKit/CoreML dominates that number).
+  `build.sh`'s existing `cp -R "$SKILLS_SRC" "$RES_DIR/Skills"` step needed no changes; it
+  already copies the directory recursively regardless of how many category/subcategory levels
+  are nested inside, confirmed via a real signed build (`codesign --verify --deep --strict`
+  clean) with all 396 `.md` files present under `Contents/Resources/Skills`.
+- **Display names**: `Role.name` (`Sources/Audium/Role.swift`) is *not* pulled directly from
+  frontmatter — both source repos' `name:` field is the same kebab-case slug as the filename
+  (e.g. `name: coverage-report-writer`), not a separate human title, so there's no cleaner field
+  to prefer. `Role.titleCase(_:)` derives the display name by title-casing the slug
+  (`"coverage-report-writer"` → `"Coverage Report Writer"`), with a small curated acronym set
+  (tv, pr, ai, seo, cms, gdpr, qa, pdf, faq) so those uppercase correctly instead of becoming
+  "Tv"/"Gdpr", plus two whole-word/phrase overrides (`youtube` → `YouTube`, `pre-production` →
+  `Pre-Production`) for cases generic title-casing gets wrong. Same function drives category and
+  subcategory display names, since both are hyphenated slugs from the same two repos'
+  conventions.
+- **Category/subcategory**: `Role.category` comes from autopunk's frontmatter `category:` field
+  (title-cased); files with no `category` field (currently just filmcraft.md) fall back to a
+  dedicated `"Filmcraft"` category rather than an empty/misc bucket. `Role.subcategory` is read
+  from the file's folder position under `Skills/autopunk/<category>/<subcategory>/` rather than
+  re-parsed from frontmatter, since the import already mirrors the source repo's folder layout
+  and that's the more authoritative source for it.
+- **Picker UI overhaul** (`Sources/Audium/RolePickerView.swift`, new file) — a flat 395-item
+  `Picker(.menu)` is unusable at this scale, per the original curated-subset design's own
+  `.frame(width: 130)` menu picker no longer being viable once the subset grew to the full set.
+  Replaced with `RolePickerButton`: a compact button (`role.name` + chevron) that opens a
+  `.popover` containing a search field (`TextField` filtering name/summary/category, live, no
+  debounce needed at this data size) and a `LazyVStack` of `Section`s — one per
+  `RoleLibrary.grouped` category, cyan pinned header, roles sorted by name within each, each row
+  showing the subcategory as a caption underneath. `RoleLibrary.grouped` is computed once
+  alongside `RoleLibrary.all` (category-grouped, alphabetically sorted) rather than per-render.
+  Verified live end-to-end via a real signed build: opened the popover, searched "coverage",
+  confirmed it surfaced "Coverage Report Writer" under Screenwriting → Revision (cross-category
+  match via summary text working correctly), selected it, confirmed the header updated and the
+  selection persisted via `ChatSettings.defaultRoleID` across an app relaunch.
+- Storage: bundled under `Skills/` (same "bundled resource" pattern as `Resources/bin/`) —
+  unchanged from the original design, just now populated by a real `git clone` of
+  `ur-grue/autopunk-media-skills` plus a scripted copy into the category/subcategory layout,
+  rather than a hand-picked file-by-file curation.
+
+### AI Chat header overflow bug — fixed (2026-07-23)
+
+Adding the role picker (above) to `AIChatPanel`'s header row made "AI Chat" render as a
+vertical, single-character-wide column instead of horizontal text — three rigid-width controls
+(Logs button, role picker, provider picker) in one `HStack` on the panel's fixed 340pt width
+left the title's `Text` squeezed down to near-zero width, and SwiftUI wraps text into a vertical
+stack of single characters when it has no horizontal room rather than truncating. Fixed by
+splitting the header into two rows: `PanelTitle("AI Chat")` alone on its own line, then a second
+row for the role picker (`.frame(maxWidth: .infinity)`, so it absorbs the panel's available
+width) and the provider picker (fixed 100pt). This makes the overflow structurally impossible
+regardless of how many controls end up in the second row, rather than just relieving pressure
+for the current control count. Verified live via a real signed build — see the screenshot check
+noted under the toolbar reorg below.
+
+### Toolbar reorganization + About panel (2026-07-23)
+
+Moved the Log Viewer button out of `AIChatPanel`'s header (freeing more of the header-overflow
+fix's second row for the role/provider pickers) and into a proper window toolbar cluster,
+alongside two new entries:
+
+- `ContentView` now carries a `.toolbar { ToolbarItemGroup(placement: .primaryAction) { ... } }`
+  with three icon buttons — About (`info.circle`), Logs (`doc.text.magnifyingglass`, same
+  `openWindow(id: "logs")` call the old in-panel button used), Settings (`gearshape`, via
+  `@Environment(\.openSettings)`, available since macOS 14 — matches this app's
+  `LSMinimumSystemVersion`, so no fallback needed). Rendered next to the traffic lights since
+  the app uses `.windowStyle(.hiddenTitleBar)`, which unifies the toolbar into the title bar
+  area — idiomatic for a macOS app in this style, and keeps these controls out of any content
+  panel rather than embedded in one, per the task's own framing.
+- **New `AboutView.swift`** — a real About panel (app name/version/build from
+  `Bundle.main`'s `CFBundleDisplayName`/`CFBundleShortVersionString`/`CFBundleVersion`, app
+  icon, one-line description), opened via a new `Window("About Audium", id: "about")` scene in
+  `AudiumApp.swift` (same pattern as the existing Logs window). Includes a disabled "Check for
+  Updates…" button with a `.help()` tooltip explaining it's not yet implemented — a labeled
+  placeholder rather than a silent gap, same treatment as the DMG-packaging placeholder in
+  `build.sh` (Section 7). A full auto-update mechanism (Sparkle or similar) is a separate,
+  much bigger feature — explicitly out of scope for this pass, noted here as a future item.
+- Verified live end-to-end via a real signed build and macOS Accessibility-driven clicks
+  (`cliclick`/AppleScript `AXPress`, same class of tooling as the YouTube drag-and-drop tests
+  in Section 3): toolbar icons render correctly next to the traffic lights; About opens and
+  shows "Audium" / "Version 0.1 (1)" with the disabled Check-for-Updates button; Logs opens the
+  existing `LogViewerView` unchanged; Settings opens via `openSettings()`. AI Chat header
+  confirmed rendering "AI Chat" horizontally with the role picker (`role.name` + chevron,
+  showing the persisted selection, e.g. "Coverage Report Writer") and provider picker
+  side-by-side on the second row, title never squeezed.
+
+### Keychain reset investigation — root-caused, not a persistent block (2026-07-23)
+
+User report: suspected accidentally clicking Deny on a Keychain trust prompt left the app
+unable to access saved API keys, with no prompt appearing at all on relaunch. Investigated
+whether Deny created a persistent block vs. a transient one-off. **Reproduced live** (opening
+Settings on a freshly rebuilt binary triggered a real `SecurityAgent` prompt for both the
+`gemini` and `openai` items) and found two distinct, real things:
+
+1. **Deny does not create a persistent block.** Each stale-ACL access attempt gets its own fresh
+   prompt — confirmed by triggering the prompt, denying it, then reopening Settings and getting
+   a fresh prompt again (not a cached/suppressed denial). The underlying mechanism: `save()`
+   creates a self-only `SecAccess` (`SecAccessCreate(label, nil, &access)`) that, empirically,
+   trusts the exact code identity of the process that created it — a fresh `swift build`/
+   `build.sh` produces a new binary and thus invalidates previously-saved items' ACLs even
+   though the binary is still signed with the same stable "Audium Local Dev" certificate
+   (Section 3, Build & distribution). This is a broader/more general version of the
+   already-documented "stale item ACL after cert regeneration" issue below — it turns out *any*
+   rebuild can trigger it, not just an actual cert regeneration.
+2. **The interactive prompt is a dead end for a human.** Its "Allow"/"Always Allow" buttons
+   require typing "the 'Audium' keychain password" — but that password is never chosen by, or
+   shown to, any human; it's re-derived on every launch via HKDF from a random salt
+   (`KeychainStore.derivedPassword()`, by design, so there's nothing "at rest" to protect). Only
+   "Deny" is a button a real user can meaningfully click. So the user's Deny wasn't a mistake —
+   it was the only actionable option on a prompt that can't be affirmatively resolved. The real
+   recovery path is re-entering and re-saving the key in Settings: `KeychainStore.save()` does a
+   fresh `SecItemDelete`+`SecItemAdd` from inside the already-trusted running process, which
+   sets a new self-only ACL without ever hitting that unsatisfiable prompt. Confirmed live:
+   after re-saving through Settings, reopening Settings again read the key back with zero
+   prompts.
+3. **Real bug found and fixed as a result**: `SettingsView.loadExistingKeys()` used `try?` to
+   swallow `KeychainStore.load()` errors, so a failed read (stale ACL, denied prompt, etc.)
+   looked *identical* to "no key ever saved" — blank fields, no error, no indication anything
+   needed fixing. This is almost certainly what the user actually experienced after their Deny:
+   not "no prompt," but a prompt they had no way to satisfy, followed by silence. Fixed:
+   `loadExistingKeys()` now distinguishes a failed read from an absent key and sets `status` to
+   "Couldn't read saved keys from Keychain (access denied or out of date). Re-enter and Save
+   Keys to fix." — confirmed live, this message appears exactly when expected and disappears
+   once the keys are re-saved.
+
+Net: no code change was needed for the ACL mechanism itself (re-saving through Settings already
+recovers correctly, and did before this investigation too) — the fix is purely the
+observability gap in Settings, which was the actual source of user-facing confusion.
+
+### Build sequencing (this is too large for one pass)
+
+Rough phase order, to be refined as each lands:
+1. AI Chat roles — **complete (2026-07-23)**: all 394 autopunk skills + filmcraft imported,
+   grouped/searchable picker UI, human-readable display names. (Originally scoped as a curated
+   ~14-file subset with a stock menu picker; expanded to the full set once the picker UI could
+   handle grouping/search at that scale — see the Roles subsection above.)
+2. Project data model + project browser UI (foundation everything else needs)
+3. Video playback upgrade (AVPlayer)
+4. Highlight marking in transcript panel
+5. Paper Edit assembly view + reordering
+6. `.docx` export (transcript + paper edit formats)
+
+## 9. v2 Roadmap — Additional Items (not yet sequenced against Section 8 above)
 
 - **NVIDIA Parakeet** as an alternative local ASR engine alongside WhisperKit — CoreML-viable
   on Apple Silicon, claimed ~20× faster than Whisper (per TranscribeX competitor research).

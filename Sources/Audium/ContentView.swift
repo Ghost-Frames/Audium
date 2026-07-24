@@ -9,6 +9,7 @@ import SpeakerKit
 /// and playback (spec §2) live in `AudioPlaybackController`/`WaveformPanel` below.
 struct ContentView: View {
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
 
     @State private var segments: [TranscriptSegment] = []
     @State private var status = "Drop an audio file to begin"
@@ -45,12 +46,31 @@ struct ContentView: View {
                     playback: playback
                 )
             }
-            AIChatPanel(segments: segments, onShowLogs: { openWindow(id: "logs") })
+            AIChatPanel(segments: segments)
                 .frame(width: 340)
         }
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.background)
+        .toolbar {
+            // Window toolbar cluster (spec §8/toolbar reorg) — Settings/About/Logs live here now
+            // instead of inside AIChatPanel's header, which was fighting the role/provider
+            // pickers for the panel's fixed 340pt width (see the "AI Chat" header overflow fix).
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button { openWindow(id: "about") } label: {
+                    Image(systemName: "info.circle")
+                }
+                .help("About Audium")
+                Button { openWindow(id: "logs") } label: {
+                    Image(systemName: "doc.text.magnifyingglass")
+                }
+                .help("Show Logs")
+                Button { openSettings() } label: {
+                    Image(systemName: "gearshape")
+                }
+                .help("Settings")
+            }
+        }
     }
 
     private func handleDrop(providers: [NSItemProvider]) -> Bool {
@@ -570,12 +590,14 @@ private struct ChatMessage: Identifiable {
 /// (here: Cleanup/Summarize quick actions) above the text field + submit button.
 private struct AIChatPanel: View {
     let segments: [TranscriptSegment]
-    let onShowLogs: () -> Void
 
     @State private var messages: [ChatMessage] = []
     @State private var inputText = ""
     @State private var isLoading = false
     @State private var providerKind = ChatSettings.defaultProvider
+    @State private var selectedRole: Role? = ChatSettings.defaultRoleID.flatMap { id in
+        RoleLibrary.all.first { $0.id == id }
+    }
 
     private var transcriptText: String {
         segments.map(\.text).joined(separator: " ")
@@ -583,16 +605,16 @@ private struct AIChatPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 12) {
-                PanelTitle("AI Chat")
-                Spacer()
-                Button(action: onShowLogs) {
-                    Image(systemName: "doc.text.magnifyingglass")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(Theme.accent)
-                }
-                .buttonStyle(.plain)
-                .help("Show Logs")
+            // Two rows, not one (spec fix: "AI Chat" header overflow) — cramming the title plus
+            // the role picker and provider picker into a single HStack on this panel's fixed
+            // 340pt width let two rigid-width Pickers squeeze the title's Text down to near-zero
+            // width, which SwiftUI renders as a vertical single-character column. Splitting the
+            // title onto its own row makes that layout impossible regardless of control count.
+            PanelTitle("AI Chat")
+            HStack(spacing: 8) {
+                RolePickerButton(selection: $selectedRole)
+                    .onChange(of: selectedRole) { _, newValue in ChatSettings.defaultRoleID = newValue?.id }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 Picker("", selection: $providerKind) {
                     ForEach(AIProviderKind.allCases) { kind in
                         Text(kind.displayName).tag(kind)
@@ -670,6 +692,9 @@ private struct AIChatPanel: View {
         inputText = ""
 
         var apiMessages: [Message] = []
+        if let role = selectedRole {
+            apiMessages.append(Message(role: .system, content: role.systemPrompt))
+        }
         if !transcriptText.isEmpty {
             apiMessages.append(Message(
                 role: .system,

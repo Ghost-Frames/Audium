@@ -197,6 +197,7 @@ enum AIProviderKind: String, CaseIterable, Identifiable {
 /// TranscriptionSettings' default-transcription-provider storage.
 enum ChatSettings {
     private static let defaultProviderKey = "com.postproduction.Audium.defaultAIProvider"
+    private static let defaultRoleKey = "com.postproduction.Audium.defaultAIRole"
 
     static var defaultProvider: AIProviderKind {
         get {
@@ -206,5 +207,12 @@ enum ChatSettings {
         set {
             UserDefaults.standard.set(newValue.rawValue, forKey: defaultProviderKey)
         }
+    }
+
+    /// Stores the selected Role's `id` (its Skills/ filename) — nil means "No role". Resolved
+    /// back to a `Role` via `RoleLibrary.all` since UserDefaults can't hold the struct itself.
+    static var defaultRoleID: String? {
+        get { UserDefaults.standard.string(forKey: defaultRoleKey) }
+        set { UserDefaults.standard.set(newValue, forKey: defaultRoleKey) }
     }
 }
