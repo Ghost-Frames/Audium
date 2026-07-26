@@ -17,7 +17,7 @@ struct AudiumApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .frame(minWidth: 1100, idealWidth: 1400, minHeight: 700, idealHeight: 860)
+                .frame(minWidth: 1320, idealWidth: 1600, minHeight: 700, idealHeight: 860)
         }
         .windowStyle(.hiddenTitleBar)
         .commands {

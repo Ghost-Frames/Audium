@@ -13,4 +13,5 @@ enum AudiumLog {
     static let aiChat = Logger(subsystem: subsystem, category: "AIChat")
     static let keychain = Logger(subsystem: subsystem, category: "Keychain")
     static let youtube = Logger(subsystem: subsystem, category: "YouTube")
+    static let project = Logger(subsystem: subsystem, category: "Project")
 }

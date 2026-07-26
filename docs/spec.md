@@ -376,6 +376,112 @@ into the real NLE afterward; this tool handles the screening/scripting phase bef
 - A separate **Paper Edit view** (new panel, tab, or window) showing the assembled sequence,
   reorderable, each entry showing source + timestamp + text, playable in order.
 
+### Project data model + browser UI — smoke test complete (2026-07-26)
+
+Implementation lives in `Sources/Audium/Project.swift` (data model + `ProjectController`) and
+`ContentView.swift` (`ProjectBrowserPanel` sidebar + waveform-panel integration). Real GUI smoke
+test run against the signed `build/Audium.app` (not `swift build` alone), using
+Accessibility-driven automation (AXPress via System Events, positional element paths — named
+AppleScript title lookups like `button "X" of sheet 1` unreliably fail with `-1728`, use
+positional indices instead) for everything except NSSavePanel/NSOpenPanel confirmation and
+Finder-drag release, which are not synthetically automatable (see permanent note below) and were
+done by a human. All items below were independently verified via on-disk file/JSON inspection
+and/or `log show` against the app's own unified-logging output, not just visual UI state.
+
+**Final on-disk project layout** (matches the doc comment at the top of `Project.swift`):
+```
+MyProject/
+  .audiumproject.json       <- single metadata file: id, name, folders[] (each folder has
+                                id, name, dailies[]); each daily has id, displayName,
+                                mediaFilename, addedAt, transcript, highlights[]
+  Scene 1 - INT Kitchen/    <- ProjectFolder, user-named, single level (no nesting)
+    3F2504E0-....aiff       <- copied media, filename = "<dailyID>.<original extension>";
+                                displayName in the JSON preserves the original filename
+    9F86D081-....aiff
+  Interview - Josh Pratt/
+```
+Media is always copied into the project folder (never referenced in place) — see the rationale
+comment in `Project.swift` (self-contained/zippable project folder, no dangling refs, uniform
+handling of YouTube-downloaded dailies).
+
+**Smoke test results (all 7 original scope items), against a real signed rebuild:**
+1. `build.sh` rebuild — clean, ad-hoc/cert signing succeeded.
+2. New Project — folder + `.audiumproject.json` confirmed created on disk with correct shape
+   (NSSavePanel itself isn't automatable — see below — so project creation for this test was
+   seeded directly on disk matching the exact Codable JSON shape, then opened via the in-app
+   Recent list, which **is** a plain automatable SwiftUI button; every mutation after that point
+   — folders, dailies, deletes — went through the real running app, not manual JSON edits).
+3. 3 sub-folders added ("Scene 1 - INT Kitchen", "Scene 2 - EXT Backyard", "Interview - Josh
+   Pratt") via the real "+ New Folder" alert flow.
+4. Real test dialogue clips (`scene1_take1.aiff`, `scene1_take2.aiff`, `interview_clip.aiff`,
+   generated via `say -r 120 -o ...`, ~7-8s each) dragged into different sub-folders by a human
+   (Finder→Audium drag-and-drop is not synthetically completable — see below). Multiple dailies
+   added to the same sub-folder confirmed working (Scene 1 ended up with two, added at different
+   times). Each transcribed (Gemini) and diarized (SpeakerKit) automatically on ingest, confirmed
+   via `log show` (`Daily added: ... to folder ...` → `Gemini transcription started/succeeded` →
+   `Diarization started/succeeded`) and via the resulting `.audiumproject.json` transcript text
+   matching the source clip's actual dialogue.
+5. Clicking between Dailies in the sidebar correctly swaps Waveform/Transcript panel content —
+   confirmed via AX-read duration + transcript text changing correctly in both directions
+   (Kitchen ↔ Interview), no stale data.
+6. Full quit (`osascript ... quit`, confirmed process gone) → relaunch (`open build/Audium.app`)
+   → reopen via Recent → sidebar tree (all 3 folders, correct dailies, correct filenames) and
+   transcripts confirmed identical to pre-quit on-disk state. Persistence fully round-trips.
+7. Standalone (no-project) drag-and-drop confirmed still working — with the project explicitly
+   closed first, a dropped clip transcribes directly (confirmed via `log show`: a
+   `Gemini transcription started` line with **no** preceding `Daily added: ... to folder ...`
+   line, proving it took the standalone code path in `ContentView.ingest(_:)`, not the
+   project-ingest path).
+
+**Bugs found via this live testing and fixed (all in the same pass, re-verified after fix):**
+- **Filename bug**: dropped files showed their generated UUID instead of the original filename
+  in the project browser. Root cause: `ContentView.handleDrop`'s temp-copy step renamed the
+  dropped file to `UUID().uuidString + ext` *before* `ProjectController.addDaily` derives
+  `displayName` from the source filename. Fixed by copying into a UUID-named *subdirectory*
+  instead of renaming the file itself, so the original filename survives into `displayName`.
+  Confirmed fixed: `scene1_take2`/`interview_clip` both show their real names post-fix, both in
+  the live sidebar and in the persisted JSON.
+- **No delete option**: added `ProjectController.deleteFolder(_:)` and `deleteDaily(_:from:)`
+  (removes the on-disk file(s)/directory and the metadata entry, best-effort on the media
+  removal since a missing file shouldn't block clearing metadata) plus trash-icon buttons and
+  `.confirmationDialog` guards in `ProjectBrowserPanel`. If the deleted Daily was the one
+  currently loaded in the Waveform/Transcript panels, `ContentView.clearLoadedContentIfMatches`
+  resets those panels (and `AudioPlaybackController.reset()`, made internal for this purpose)
+  rather than leaving them pointing at now-deleted media.
+- **No click-to-upload alternative to drag-and-drop**: added a "Browse…" button next to the
+  existing drop zone, wired to a new `ContentView.browseForFile()` using `NSOpenPanel` (same
+  panel-presentation pattern as `Exporter`/`ProjectController`'s existing panels). Confirmed
+  working (human-driven, same Powerbox caveat as any NSOpenPanel) — routes through the same
+  `ingest(_:)` as drag-and-drop, so it correctly goes to the open project's selected folder when
+  one exists, or standalone otherwise.
+- **No re-transcribe option**: added a "Re-transcribe" button in the loaded-waveform state,
+  wired to `ContentView.retranscribeCurrent()`, which re-runs `runTranscription` against
+  whatever's currently loaded (`sourceAudioURL`/`currentDailyID`) — useful after a bad first
+  pass or a provider/model change. Confirmed working end-to-end including the correct
+  `updateDailyTranscript` write-back to the right Daily's JSON entry.
+
+### Permanent note: NSSavePanel/NSOpenPanel and Finder-drag-and-drop are not synthetically automatable
+
+Same category of macOS-enforced protection as the Secure Input Mode note above, discovered
+during this smoke test. An NSSavePanel/NSOpenPanel ("Powerbox"-mediated system panel) cannot be
+dismissed, confirmed, or cancelled via **any** synthetic input — tested exhaustively: cliclick at
+multiple coordinate calibrations, AXPress on its buttons, keyboard Return/Escape (single and
+double), Tab-to-focus-then-activate, even a synthetic drag of the panel's own title bar and its
+native traffic-light close button. None worked. Text entry into the filename field via synthetic
+keystroke *does* work — only the confirm/cancel action is blocked. Similarly, a Finder→app
+drag-and-drop can be initiated and correctly hovers/highlights a valid drop target
+programmatically, but the release/drop itself never delivers; the drag ghost persists until a
+separate standalone drag-up command visually clears it, without ever completing the actual drop.
+
+**Implication for future sessions**: any task requiring a New/Open Project dialog, an
+NSOpenPanel-based Browse action, or a Finder-to-Audium drag needs a real human at the mouse.
+Don't spend time re-attempting synthetic automation against these — go straight to asking the
+user to perform the specific click/drag, then resume automated verification (AX state reads,
+`log show`, on-disk file/JSON inspection) once they confirm it's done. Ordinary in-app SwiftUI
+controls (buttons, `.alert`, `.confirmationDialog`) remain fully automatable via AXPress with
+positional element paths, as does regular text-field entry — this limitation is specific to
+system-level Powerbox panels and cross-application drag-and-drop.
+
 ### Video playback (upgraded from audio-only)
 
 - Current `AudioPlaybackController` (AVAudioFile/AVAudioPlayer) is audio-only — v2 needs real
@@ -457,6 +563,33 @@ into the real NLE afterward; this tool handles the screening/scripting phase bef
   unchanged from the original design, just now populated by a real `git clone` of
   `ur-grue/autopunk-media-skills` plus a scripted copy into the category/subcategory layout,
   rather than a hand-picked file-by-file curation.
+- **Role feature fully confirmed (2026-07-24)** — three-way live comparison against the real
+  signed `build/Audium.app`, same test message ("What do you think of this footage? Give me
+  your honest take.") sent to Gemini under No role, Filmcraft, and one autopunk role
+  (Coverage Report Writer), confirming `role.systemPrompt` genuinely changes model behavior
+  rather than the picker just being cosmetic:
+  - **No role**: generic single-paragraph "you didn't attach any footage" reply.
+  - **Filmcraft**: reply adopts a film-professional frame — explains it needs a shot
+    breakdown/stills/script to give a "structured, professional read covering story/blocking,
+    visual choices, pacing/editing, and performance," i.e. filmcraft's crew/craft framing shows
+    up even before any real content is supplied.
+  - **Coverage Report Writer** (autopunk): reply is visibly narrower and format-driven —
+    branches into two explicit numbered options (script/synopsis vs. video footage), and the
+    script path names the exact industry-standard coverage fields (Title & Writer, Format &
+    Genre, Logline, Synopsis with Pass/Consider/Recommend framing), matching that skill's stated
+    purpose far more specifically than filmcraft's broader craft-generalist tone.
+  - Confirms both bundled skill sources (filmcraft and autopunk) are wired correctly end-to-end
+    — `RolePickerButton` selection → `ChatSettings.defaultRoleID` → `selectedRole` →
+    `Message(role: .system, content: role.systemPrompt)` injection — not just that the picker UI
+    renders and persists a selection.
+  - GUI automation note for future sessions: driving `RolePickerButton`'s popover search field
+    and the chat composer via Accessibility `set value of` (not keystroke simulation) works
+    correctly for both — confirmed the composer's `Send` button re-disables immediately after a
+    successful send (its normal empty-input state), which looks like a failed send if checked
+    immediately after clicking `Send` without first re-checking the chat transcript. These
+    `set value`/`click` AX calls work fine against a background (non-frontmost) window, but any
+    action requiring true OS-level keyboard input does not — see the Secure Input Mode note
+    below for why keystroke simulation is avoided here entirely now, not just for API keys.
 
 ### AI Chat header overflow bug — fixed (2026-07-23)
 
@@ -546,6 +679,27 @@ Net: no code change was needed for the ACL mechanism itself (re-saving through S
 recovers correctly, and did before this investigation too) — the fix is purely the
 observability gap in Settings, which was the actual source of user-facing confusion.
 
+### Permanent note: macOS Secure Input Mode blocks synthetic keystrokes into SecureFields
+
+Any GUI-automation task (Claude Code driving the real app via Accessibility/`osascript`) that
+needs to type into a `SecureField` — i.e. the API key fields in Settings — cannot use synthetic
+keystroke injection (`System Events keystroke`, `cliclick` key events, etc.). macOS Secure Input
+Mode blocks *all* synthetic keystroke delivery into a field marked secure, by OS design, as a
+platform security guarantee against exactly this kind of injection (keyloggers/automation
+reading or writing password fields). This is not a bug, not app-specific, and not scriptable
+around by any Accessibility API trick — confirmed during the 2026-07-24 role-comparison session
+after keystroke-based automation kept "fighting focus issues" against the API key fields.
+
+**Implication for future sessions**: any task requiring API key entry into Settings needs a real
+human at the keyboard. Don't spend time re-attempting keystroke automation against those fields.
+
+Ordinary (non-secure) text fields are unaffected — `set value of <field> to "..."` via
+Accessibility works fine for those (confirmed against the role-picker search field and the AI
+Chat composer in the same session), as long as the target app is actually frontmost first
+(`set frontmost of process "Audium" to true`); AX `set value`/`click` calls succeed against a
+background window, but the app must be frontmost before relying on AX-reported focus state to
+mean anything at the OS input level.
+
 ### Build sequencing (this is too large for one pass)
 
 Rough phase order, to be refined as each lands:
@@ -553,7 +707,9 @@ Rough phase order, to be refined as each lands:
    grouped/searchable picker UI, human-readable display names. (Originally scoped as a curated
    ~14-file subset with a stock menu picker; expanded to the full set once the picker UI could
    handle grouping/search at that scale — see the Roles subsection above.)
-2. Project data model + project browser UI (foundation everything else needs)
+2. Project data model + project browser UI (foundation everything else needs) — **complete
+   (2026-07-26)**, real GUI smoke test passed end-to-end. See the dedicated subsection below
+   ("Project data model + browser UI — smoke test complete") for full detail.
 3. Video playback upgrade (AVPlayer)
 4. Highlight marking in transcript panel
 5. Paper Edit assembly view + reordering

@@ -67,7 +67,9 @@ final class AudioPlaybackController: NSObject, ObservableObject {
         currentTime = clamped
     }
 
-    private func reset() {
+    /// Also called externally when the loaded file is deleted out from under the player (e.g.
+    /// deleting the currently-open Daily) and there's nothing new to `load(url:)` in its place.
+    func reset() {
         tickTask?.cancel()
         player?.stop()
         player = nil

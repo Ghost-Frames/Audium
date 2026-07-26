@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import UniformTypeIdentifiers
 import WhisperKit
 import SpeakerKit
@@ -20,10 +21,17 @@ struct ContentView: View {
     @State private var sourceAudioURL: URL?
     @State private var youtubeURLText = ""
     @State private var youtubeError: String?
+    /// The Daily currently loaded into the Waveform/Transcript panels, if any (nil for a
+    /// standalone/no-project file). Lets "Re-transcribe" and folder/daily deletion know which
+    /// on-disk Daily — if any — the currently-displayed transcript actually belongs to.
+    @State private var currentDailyID: UUID?
     @StateObject private var playback = AudioPlaybackController()
+    @StateObject private var project = ProjectController()
 
     var body: some View {
         HStack(spacing: 16) {
+            ProjectBrowserPanel(project: project, onSelectDaily: loadDaily, onDailyDeleted: clearLoadedContentIfMatches)
+                .frame(width: 240)
             VStack(spacing: 16) {
                 WaveformPanel(
                     playback: playback,
@@ -32,7 +40,9 @@ struct ContentView: View {
                     isBusy: isTranscribing,
                     urlText: $youtubeURLText,
                     error: youtubeError,
-                    onSubmitURL: { Task { await runYouTubeTranscription(urlString: youtubeURLText) } }
+                    onSubmitURL: { Task { await runYouTubeTranscription(urlString: youtubeURLText) } },
+                    onBrowse: browseForFile,
+                    onRetranscribe: { Task { await retranscribeCurrent() } }
                 )
                 .frame(height: 180)
                 .onDrop(of: [.audio], isTargeted: $isDropTargeted, perform: handleDrop)
@@ -78,14 +88,29 @@ struct ContentView: View {
         provider.loadFileRepresentation(forTypeIdentifier: UTType.audio.identifier) { url, _ in
             guard let url else { return }
             // The URL is only valid for the duration of this callback — copy it out
-            // before handing off to the (async, longer-lived) transcription task.
-            let localCopy = FileManager.default.temporaryDirectory
-                .appendingPathComponent(UUID().uuidString)
-                .appendingPathExtension(url.pathExtension)
+            // before handing off to the (async, longer-lived) transcription task. The copy lives
+            // in its own UUID-named subdirectory (rather than being renamed to a UUID itself) so
+            // the original filename survives into Daily.displayName instead of showing a UUID.
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            let localCopy = tempDir.appendingPathComponent(url.lastPathComponent)
             try? FileManager.default.copyItem(at: url, to: localCopy)
-            Task { await runTranscription(on: localCopy) }
+            Task { await ingest(localCopy) }
         }
         return true
+    }
+
+    /// Click-to-browse alternative to drag-and-drop (same `ingest()` destination either way) —
+    /// NSOpenPanel's URL is already a stable, directly-accessible file path, so unlike
+    /// `handleDrop` there's no need to copy it to a temp location first.
+    private func browseForFile() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Audio File"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.audio]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { await ingest(url) }
     }
 
     @MainActor
@@ -101,7 +126,7 @@ struct ContentView: View {
                 Task { @MainActor in status = progressText }
             }
             youtubeURLText = ""
-            await runTranscription(on: localURL)
+            await ingest(localURL)
         } catch {
             youtubeError = error.localizedDescription
             status = "Drop an audio file to begin"
@@ -110,8 +135,66 @@ struct ContentView: View {
         }
     }
 
+    /// Routes a newly-dropped/downloaded file to either standalone transcription (no project
+    /// open, unchanged v1 behavior — spec §8 point 4's decision) or project ingestion (copies
+    /// the file into the currently-selected folder as a new Daily, then transcribes that copy).
     @MainActor
-    private func runTranscription(on url: URL) async {
+    private func ingest(_ url: URL) async {
+        guard project.metadata != nil else {
+            currentDailyID = nil
+            await runTranscription(on: url)
+            return
+        }
+        guard let folderID = project.selectedFolderID else {
+            status = "Select or create a project folder first"
+            return
+        }
+        do {
+            let (daily, mediaURL) = try project.addDaily(from: url, to: folderID)
+            currentDailyID = daily.id
+            await runTranscription(on: mediaURL, dailyID: daily.id)
+        } catch {
+            status = "Couldn't add daily: \(error.localizedDescription)"
+        }
+    }
+
+    private func loadDaily(_ daily: Daily, in folder: ProjectFolder) {
+        currentDailyID = daily.id
+        segments = daily.transcript.segments
+        let url = project.mediaURL(for: daily, in: folder)
+        sourceAudioURL = url
+        playback.load(url: url)
+        status = daily.transcript.segments.isEmpty ? "No transcript yet" : "\(daily.transcript.segments.count) segments"
+        statusFraction = nil
+        isTranscribing = false
+        transcriptionStartedAt = nil
+    }
+
+    /// Re-runs transcription against whatever's currently loaded (spec fix: manual retranscribe,
+    /// for a bad first pass or a provider/model change) — same `runTranscription` the initial
+    /// ingest used, just re-invoked on demand rather than automatically.
+    @MainActor
+    private func retranscribeCurrent() async {
+        guard let sourceAudioURL else { return }
+        await runTranscription(on: sourceAudioURL, dailyID: currentDailyID)
+    }
+
+    /// Clears the loaded-file state after the currently-displayed Daily is deleted out from under
+    /// it, so the panels don't keep showing a transcript/waveform for media that no longer exists.
+    /// Only reacts when the deleted Daily is the one actually loaded — deleting some other Daily
+    /// (or a folder that doesn't contain the loaded one) shouldn't disturb what's on screen.
+    private func clearLoadedContentIfMatches(deletedDailyID: UUID) {
+        guard currentDailyID == deletedDailyID else { return }
+        currentDailyID = nil
+        segments = []
+        sourceAudioURL = nil
+        playback.reset()
+        status = "Drop an audio file to begin"
+        statusFraction = nil
+    }
+
+    @MainActor
+    private func runTranscription(on url: URL, dailyID: UUID? = nil) async {
         isTranscribing = true
         if transcriptionStartedAt == nil { transcriptionStartedAt = Date() }
         segments = []
@@ -145,6 +228,7 @@ struct ContentView: View {
             let transcript = try await provider.transcribe(audio: url)
             segments = transcript.segments
             status = "\(segments.count) segments"
+            if let dailyID { project.updateDailyTranscript(dailyID, segments: transcript.segments) }
         } catch {
             status = "Transcription failed: \(error.localizedDescription)"
         }
@@ -153,6 +237,241 @@ struct ContentView: View {
         transcriptionStartedAt = nil
     }
 
+}
+
+/// Project browser sidebar (spec §8) — 4th bento region, leftmost. Folder/daily tree for the
+/// currently open project, plus New/Open/Recent when none is open. Owns its own local UI state
+/// (error text, new-folder alert, which folders are expanded); everything project-shaped lives
+/// on `ProjectController` itself so this stays a thin presentation layer over it.
+private struct ProjectBrowserPanel: View {
+    @ObservedObject var project: ProjectController
+    let onSelectDaily: (Daily, ProjectFolder) -> Void
+    let onDailyDeleted: (UUID) -> Void
+
+    @State private var errorText: String?
+    @State private var showingNewFolderAlert = false
+    @State private var newFolderName = ""
+    @State private var expandedFolderIDs: Set<UUID> = []
+    @State private var pendingDeleteFolder: ProjectFolder?
+    @State private var pendingDeleteDaily: (daily: Daily, folder: ProjectFolder)?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            PanelTitle("Project")
+            if project.metadata == nil {
+                noProjectContent
+            } else {
+                openProjectContent
+            }
+        }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .glassPanel()
+        .onChange(of: project.rootURL) { _, _ in
+            expandedFolderIDs = Set(project.metadata?.folders.map(\.id) ?? [])
+        }
+    }
+
+    private var noProjectContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("No project open — drag-and-drop still works above for a quick one-off transcription.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button("New Project…") { newProject() }
+                .font(.caption.bold())
+                .buttonStyle(.accent)
+            Button("Open Project…") { openProject() }
+                .font(.caption.bold())
+                .buttonStyle(.accent)
+            let recents = ProjectSettings.recentPaths
+            if !recents.isEmpty {
+                Divider()
+                Text("Recent").font(.caption.bold()).foregroundStyle(.secondary)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(recents, id: \.self) { path in
+                            Button(URL(fileURLWithPath: path).lastPathComponent) { openRecent(path) }
+                                .buttonStyle(.plain)
+                                .font(.caption)
+                                .foregroundStyle(Theme.accent)
+                        }
+                    }
+                }
+            }
+            if let errorText {
+                Text(errorText).font(.caption2).foregroundStyle(.red)
+            }
+            Spacer()
+        }
+    }
+
+    private var openProjectContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(project.metadata?.name ?? "").font(.caption.bold()).foregroundStyle(Theme.accent)
+                Spacer()
+                Button { project.close() } label: {
+                    Image(systemName: "xmark.circle")
+                }
+                .buttonStyle(.plain)
+                .help("Close Project")
+            }
+            Button("+ New Folder") { showingNewFolderAlert = true }
+                .font(.caption.bold())
+                .buttonStyle(.accent)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(project.metadata?.folders ?? []) { folder in
+                        folderRow(folder)
+                    }
+                }
+            }
+            if let errorText {
+                Text(errorText).font(.caption2).foregroundStyle(.red)
+            }
+        }
+        .alert("New Folder", isPresented: $showingNewFolderAlert) {
+            TextField("Folder name", text: $newFolderName)
+            Button("Create") { createFolder() }
+            Button("Cancel", role: .cancel) { newFolderName = "" }
+        }
+        .confirmationDialog(
+            "Delete “\(pendingDeleteFolder?.name ?? "")” and everything in it?",
+            isPresented: Binding(get: { pendingDeleteFolder != nil }, set: { if !$0 { pendingDeleteFolder = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Delete Folder", role: .destructive) { deleteFolder() }
+            Button("Cancel", role: .cancel) { pendingDeleteFolder = nil }
+        }
+        .confirmationDialog(
+            "Delete “\(pendingDeleteDaily?.daily.displayName ?? "")”?",
+            isPresented: Binding(get: { pendingDeleteDaily != nil }, set: { if !$0 { pendingDeleteDaily = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Delete Daily", role: .destructive) { deleteDaily() }
+            Button("Cancel", role: .cancel) { pendingDeleteDaily = nil }
+        }
+    }
+
+    private func folderRow(_ folder: ProjectFolder) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Button {
+                    if expandedFolderIDs.contains(folder.id) {
+                        expandedFolderIDs.remove(folder.id)
+                    } else {
+                        expandedFolderIDs.insert(folder.id)
+                    }
+                } label: {
+                    Image(systemName: expandedFolderIDs.contains(folder.id) ? "chevron.down" : "chevron.right")
+                        .font(.caption2)
+                }
+                .buttonStyle(.plain)
+                Button(folder.name) { project.selectedFolderID = folder.id }
+                    .buttonStyle(.plain)
+                    .font(.caption.bold())
+                    .foregroundStyle(project.selectedFolderID == folder.id ? Theme.accent : .primary)
+                Spacer()
+                Button { pendingDeleteFolder = folder } label: {
+                    Image(systemName: "trash").font(.caption2)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Delete Folder")
+            }
+            if expandedFolderIDs.contains(folder.id) {
+                ForEach(folder.dailies) { daily in
+                    HStack(spacing: 4) {
+                        Button {
+                            project.selectedFolderID = folder.id
+                            project.selectedDailyID = daily.id
+                            onSelectDaily(daily, folder)
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "waveform").font(.caption2)
+                                Text(daily.displayName).font(.caption).lineLimit(1)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(project.selectedDailyID == daily.id ? Theme.accent : .secondary)
+                        Spacer()
+                        Button { pendingDeleteDaily = (daily, folder) } label: {
+                            Image(systemName: "trash").font(.caption2)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .help("Delete Daily")
+                    }
+                    .padding(.leading, 18)
+                }
+            }
+        }
+    }
+
+    private func deleteFolder() {
+        guard let folder = pendingDeleteFolder else { return }
+        pendingDeleteFolder = nil
+        do {
+            for daily in folder.dailies { onDailyDeleted(daily.id) }
+            try project.deleteFolder(folder.id)
+            errorText = nil
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
+
+    private func deleteDaily() {
+        guard let (daily, folder) = pendingDeleteDaily else { return }
+        pendingDeleteDaily = nil
+        do {
+            try project.deleteDaily(daily.id, from: folder.id)
+            onDailyDeleted(daily.id)
+            errorText = nil
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
+
+    private func createFolder() {
+        let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        newFolderName = ""
+        guard !name.isEmpty else { return }
+        do {
+            try project.addFolder(name: name)
+            errorText = nil
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
+
+    private func newProject() {
+        guard let url = ProjectController.presentNewProjectPanel() else { return }
+        do {
+            try project.createNew(at: url)
+            errorText = nil
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
+
+    private func openProject() {
+        guard let url = ProjectController.presentOpenProjectPanel() else { return }
+        do {
+            try project.open(at: url)
+            errorText = nil
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
+
+    private func openRecent(_ path: String) {
+        do {
+            try project.open(at: URL(fileURLWithPath: path))
+            errorText = nil
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
 }
 
 /// Real waveform + playback (spec §2). Bar-style amplitude visualizer — a row of vertical bars
@@ -174,6 +493,8 @@ private struct WaveformPanel: View {
     @Binding var urlText: String
     let error: String?
     let onSubmitURL: () -> Void
+    let onBrowse: () -> Void
+    let onRetranscribe: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -205,6 +526,12 @@ private struct WaveformPanel: View {
                     .foregroundStyle(.red)
             }
             Spacer()
+            // Click-to-browse (spec fix: not everyone wants drag-and-drop) — feeds the exact same
+            // ingest path as a drop, just sourced via NSOpenPanel instead of NSItemProvider.
+            Button("Browse…") { onBrowse() }
+                .font(.caption.bold())
+                .buttonStyle(.accent)
+                .disabled(isBusy)
             // YouTube URL transcription (spec §2) — alongside drag-and-drop, not a replacement.
             HStack(spacing: 8) {
                 TextField("Paste a YouTube URL…", text: $urlText)
@@ -242,6 +569,13 @@ private struct WaveformPanel: View {
                 Text(formatTime(playback.duration))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
+                // Manual re-transcribe (spec fix: a bad first pass or a provider/model change
+                // shouldn't require re-dropping the file) — reruns against the already-loaded URL.
+                Button("Re-transcribe") { onRetranscribe() }
+                    .font(.caption.bold())
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Theme.accent)
+                    .disabled(isBusy)
                 Spacer()
                 if isBusy {
                     Text(status)

@@ -3,7 +3,9 @@ import AVFoundation
 import WhisperKit
 import OSLog
 
-struct TranscriptSegment: Identifiable {
+struct TranscriptSegment: Identifiable, Codable {
+    // SwiftUI/ForEach identity only, not persisted (see CodingKeys below) — nothing keys off a
+    // segment's id across a save/reload, a Daily's transcript is replaced whole-array on update.
     let id = UUID()
     // Editable in place (spec §2, "Transcript editing"). `start`/`end` stay fixed to whatever
     // transcription produced — v1 is text-only correction, no word-level timestamp resync
@@ -12,9 +14,20 @@ struct TranscriptSegment: Identifiable {
     let start: TimeInterval
     let end: TimeInterval
     var speaker: String?
+
+    init(text: String, start: TimeInterval, end: TimeInterval, speaker: String? = nil) {
+        self.text = text
+        self.start = start
+        self.end = end
+        self.speaker = speaker
+    }
+
+    private enum CodingKeys: String, CodingKey { case text, start, end, speaker }
 }
 
-struct Transcript {
+// Codable (spec §8) so a Daily's Transcript can be persisted inline in a Project's single JSON
+// metadata file — no separate transcript sidecar files, see Project.swift's doc comment.
+struct Transcript: Codable {
     var segments: [TranscriptSegment]
 }
 
