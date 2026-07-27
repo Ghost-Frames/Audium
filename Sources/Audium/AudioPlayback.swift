@@ -1,10 +1,14 @@
 import AVFoundation
+import AVKit
 
-/// Drives waveform + playback for the currently-loaded audio file (spec §2, "Real audio waveform
-/// visualization + playback"). AVAudioPlayer over AVPlayer — this is always a local file
-/// (drag-and-drop copy or downloaded YouTube audio, never a remote stream), and AVAudioPlayer's
-/// `currentTime` is a plain synchronous property rather than AVPlayer's async/observer-based time
-/// reporting, which is simpler for the playhead poll below.
+/// Drives waveform/video preview + playback for the currently-loaded media file (spec §2 "Real
+/// audio waveform visualization + playback", spec §8 "Video playback (upgraded from audio-only)").
+/// Audio files use `AVAudioPlayer` — always a local file (drag-and-drop copy or downloaded
+/// YouTube audio, never a remote stream), and its `currentTime` is a plain synchronous property
+/// rather than AVPlayer's async/observer-based time reporting, which is simpler for the playhead
+/// poll below. Video files use `AVPlayer` instead (`AVAudioPlayer` doesn't play video), driving a
+/// SwiftUI `VideoPlayer` in `WaveformPanel`; audio-only files still get the bar waveform, per the
+/// spec's explicit "audio-only dailies still use the existing waveform view" decision.
 @MainActor
 final class AudioPlaybackController: NSObject, ObservableObject {
     @Published private(set) var isPlaying = false
@@ -12,6 +16,11 @@ final class AudioPlaybackController: NSObject, ObservableObject {
     @Published private(set) var currentTime: TimeInterval = 0
     @Published private(set) var waveformSamples: [Float] = []
     @Published private(set) var isLoaded = false
+    @Published private(set) var isVideo = false
+    /// Bound directly into SwiftUI's `VideoPlayer(player:)` when `isVideo`; nil otherwise.
+    @Published private(set) var avPlayer: AVPlayer?
+
+    nonisolated static let videoExtensions: Set<String> = ["mp4", "mov", "m4v", "avi", "mkv", "webm"]
 
     /// A few hundred bars reads as a waveform at typical panel widths (~600-900pt) without
     /// per-sample overkill — one bar per 2-3pt.
@@ -19,9 +28,23 @@ final class AudioPlaybackController: NSObject, ObservableObject {
 
     private var player: AVAudioPlayer?
     private var tickTask: Task<Void, Never>?
+    private var timeObserverToken: Any?
+    private var endObserverToken: NSObjectProtocol?
+    /// Keeps `isPlaying` accurate when playback is toggled via the native `VideoPlayer` transport
+    /// controls (scrub bar, its own play/pause) rather than our own button — `play()`/`pause()`
+    /// alone only cover taps on our button.
+    private var statusObservation: NSKeyValueObservation?
 
     func load(url: URL) {
         reset()
+        if Self.videoExtensions.contains(url.pathExtension.lowercased()) {
+            loadVideo(url: url)
+        } else {
+            loadAudio(url: url)
+        }
+    }
+
+    private func loadAudio(url: URL) {
         guard let player = try? AVAudioPlayer(contentsOf: url) else { return }
         player.delegate = self
         player.prepareToPlay()
@@ -37,33 +60,81 @@ final class AudioPlaybackController: NSObject, ObservableObject {
         }
     }
 
+    private func loadVideo(url: URL) {
+        isVideo = true
+        let item = AVPlayerItem(url: url)
+        let avPlayer = AVPlayer(playerItem: item)
+        self.avPlayer = avPlayer
+        isLoaded = true
+
+        timeObserverToken = avPlayer.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.05, preferredTimescale: 600), queue: .main) { [weak self] time in
+            Task { @MainActor in self?.currentTime = time.seconds }
+        }
+        endObserverToken = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                self?.isPlaying = false
+                self?.currentTime = 0
+                self?.avPlayer?.seek(to: .zero)
+            }
+        }
+        statusObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+            let playing = player.timeControlStatus == .playing
+            Task { @MainActor in self?.isPlaying = playing }
+        }
+
+        Task {
+            let loadedDuration = (try? await item.asset.load(.duration)) ?? .zero
+            self.duration = loadedDuration.seconds.isFinite ? loadedDuration.seconds : 0
+        }
+    }
+
     func togglePlayPause() {
         isPlaying ? pause() : play()
     }
 
     func play() {
-        guard let player, isLoaded else { return }
-        player.play()
-        isPlaying = true
-        tickTask?.cancel()
-        tickTask = Task { [weak self] in
-            while let self, self.isPlaying {
-                self.currentTime = self.player?.currentTime ?? 0
-                try? await Task.sleep(nanoseconds: 50_000_000)
+        guard isLoaded else { return }
+        if isVideo {
+            avPlayer?.play()
+            isPlaying = true
+        } else {
+            guard let player else { return }
+            player.play()
+            isPlaying = true
+            tickTask?.cancel()
+            tickTask = Task { [weak self] in
+                while let self, self.isPlaying {
+                    self.currentTime = self.player?.currentTime ?? 0
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
             }
         }
     }
 
     func pause() {
-        player?.pause()
-        isPlaying = false
-        tickTask?.cancel()
-        currentTime = player?.currentTime ?? currentTime
+        if isVideo {
+            avPlayer?.pause()
+            isPlaying = false
+        } else {
+            player?.pause()
+            isPlaying = false
+            tickTask?.cancel()
+            currentTime = player?.currentTime ?? currentTime
+        }
     }
 
     func seek(to time: TimeInterval) {
-        let clamped = max(0, min(time, duration))
-        player?.currentTime = clamped
+        // `duration` is 0 until `loadVideo`'s async `asset.load(.duration)` resolves — clamping
+        // against it during that window (e.g. Paper Edit's load-then-immediately-seek) would
+        // wrongly force every seek to 0. Only clamp the upper bound once a real duration is known;
+        // AVPlayer safely clamps an out-of-range seek to the item's actual duration internally.
+        let upperBound = duration > 0 ? duration : .greatestFiniteMagnitude
+        let clamped = max(0, min(time, upperBound))
+        if isVideo {
+            avPlayer?.seek(to: CMTime(seconds: clamped, preferredTimescale: 600))
+        } else {
+            player?.currentTime = clamped
+        }
         currentTime = clamped
     }
 
@@ -73,6 +144,15 @@ final class AudioPlaybackController: NSObject, ObservableObject {
         tickTask?.cancel()
         player?.stop()
         player = nil
+        if let timeObserverToken { avPlayer?.removeTimeObserver(timeObserverToken) }
+        timeObserverToken = nil
+        if let endObserverToken { NotificationCenter.default.removeObserver(endObserverToken) }
+        endObserverToken = nil
+        statusObservation?.invalidate()
+        statusObservation = nil
+        avPlayer?.pause()
+        avPlayer = nil
+        isVideo = false
         isPlaying = false
         currentTime = 0
         duration = 0

@@ -142,6 +142,44 @@ private func audioDurationSeconds(_ url: URL) async throws -> TimeInterval {
     return CMTimeGetSeconds(duration)
 }
 
+/// Video dailies (spec §8, video playback) are transcribed the same way audio ones are — every
+/// `TranscriptionProvider` and `SpeakerDiarizer` reads its input as an audio file (`AVAudioFile`
+/// under the hood for WhisperKit/diarization, raw `Data` for the cloud APIs), which can't open a
+/// multiplexed video container directly. Called once up front in `ContentView.runTranscription`
+/// so every provider gets a plain `.m4a` regardless of backend.
+///
+/// `@MainActor` isn't for UI safety here — `AVAssetExportSession.init` itself is thread-agnostic.
+/// It's required to avoid a real crash (spec §5, Known Issues): a plain non-actor-isolated async
+/// function called from `@MainActor` code runs its body on the global concurrent executor, not on
+/// the calling actor's thread. That put this init on a background thread at the exact moment
+/// `runTranscription`'s prior `playback.load(url:)` call was making SwiftUI's `VideoPlayer` touch
+/// AVKit/AVFoundation's Swift generic metadata for the first time on the main thread — two
+/// threads racing to instantiate overlapping generic metadata, which crashed with SIGABRT deep in
+/// the Swift runtime. Pinning this function to `@MainActor` serializes both first-touches onto
+/// one thread; the actual encode still runs on AVFoundation's own queue after
+/// `exportAsynchronously` is called; that queue doesn't touch AVKit-SwiftUI metadata.
+@MainActor
+func extractedAudioURL(from url: URL) async throws -> URL {
+    guard AudioPlaybackController.videoExtensions.contains(url.pathExtension.lowercased()) else { return url }
+    let asset = AVURLAsset(url: url)
+    guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
+        throw TranscriptionError.unsupportedAudioFormat(url.pathExtension)
+    }
+    let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".m4a")
+    export.outputURL = outputURL
+    export.outputFileType = .m4a
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        export.exportAsynchronously {
+            switch export.status {
+            case .completed: continuation.resume()
+            case .failed, .cancelled: continuation.resume(throwing: export.error ?? TranscriptionError.emptyResponse)
+            default: continuation.resume(throwing: TranscriptionError.emptyResponse)
+            }
+        }
+    }
+    return outputURL
+}
+
 /// Cloud, via Gemini's native multimodal audio input. Reads its key from the same
 /// Keychain entry (.gemini) that GeminiProvider (AIProvider) uses.
 ///

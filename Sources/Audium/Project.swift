@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Foundation
 
 /// Spec §8 data model — a Project is a real folder on disk, not a database, same spirit as an
@@ -26,6 +27,30 @@ struct ProjectMetadata: Codable {
     let id: UUID
     var name: String
     var folders: [ProjectFolder]
+    var paperEdits: [PaperEdit] = []
+
+    private enum CodingKeys: String, CodingKey { case id, name, folders, paperEdits }
+
+    init(id: UUID, name: String, folders: [ProjectFolder], paperEdits: [PaperEdit] = []) {
+        self.id = id
+        self.name = name
+        self.folders = folders
+        self.paperEdits = paperEdits
+    }
+
+    /// Custom decode (found via real GUI testing, spec §5 Known Issues): a stored property's
+    /// `= []` default is *not* used by Swift's synthesized `Decodable` for a genuinely-missing
+    /// key — only `Optional` properties fall back to `nil` automatically. Every project JSON
+    /// saved before this field existed lacks the `"paperEdits"` key entirely, so opening one with
+    /// the synthesized decoder threw `keyNotFound` and failed to open at all.
+    /// `decodeIfPresent(...) ?? []` handles that migration explicitly.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        folders = try container.decode([ProjectFolder].self, forKey: .folders)
+        paperEdits = try container.decodeIfPresent([PaperEdit].self, forKey: .paperEdits) ?? []
+    }
 }
 
 struct ProjectFolder: Codable, Identifiable {
@@ -42,14 +67,58 @@ struct Daily: Codable, Identifiable {
     var mediaFilename: String
     var addedAt: Date
     var transcript: Transcript
-    /// Stub for spec §8's future Highlight feature (range/tag/color/note within a transcript) —
-    /// deliberately not implemented yet, this pass is data model + browser only. Reserving the
-    /// slot now avoids a breaking metadata-format migration when highlight marking lands later.
     var highlights: [Highlight] = []
+    /// Nominal frame rate for video dailies (nil for audio-only, or a video daily added before
+    /// this field existed — Codable's default-on-missing-key handles that migration for free).
+    /// Not used by anything yet — groundwork for the next phase (EDL export), which needs a
+    /// frame rate to convert Paper Edit timestamps into editorial timecode. Captured opportunistically
+    /// in `ProjectController.addDaily` for video files via `AVAssetTrack.load(.nominalFrameRate)`
+    /// rather than left for a future backfill pass — every video Daily added between now and
+    /// when EDL export actually lands would otherwise need retroactively re-scanning.
+    var frameRate: Double?
 }
 
+/// A marked range within a Daily's transcript (spec §8). Anchored to `start`/`end` timestamps —
+/// not `TranscriptSegment.id` (regenerated fresh on every decode, deliberately excluded from its
+/// own `Codable` conformance — see that type's doc comment) and not an array index (unstable
+/// across a re-transcribe, which fully replaces `Transcript.segments`). Timestamps are the one
+/// piece of segment identity that's both persisted and stable, so a Highlight looks its segment(s)
+/// back up by matching `start`/`end` against the current transcript at display time. Single-
+/// segment for this pass (`start`/`end` mirror the one highlighted `TranscriptSegment` exactly);
+/// a future cross-segment range is just a wider `start`/`end` pair spanning several segments, no
+/// format change needed. `note` is freeform and optional; no separate `tag`/`color` field — the
+/// app's design language deliberately uses a single accent color throughout (see
+/// `WaveformBarsView`'s doc comment), so there's no second hue for a highlight color picker to
+/// select between.
 struct Highlight: Codable, Identifiable {
     let id: UUID
+    var start: TimeInterval
+    var end: TimeInterval
+    var note: String?
+    var createdAt: Date
+}
+
+/// The assembled "selects" reel (spec §8) — an ordered sequence of `PaperEditEntry`, each
+/// referencing a Highlight rather than copying its text/timestamps, so edits to the underlying
+/// transcript/highlight propagate automatically. A Project can hold multiple named Paper Edits
+/// (real editorial workflow rarely wants just one assembly per project — e.g. a "selects" reel
+/// vs. a tighter "presentation cut" from the same dailies), not just a single unnamed one.
+struct PaperEdit: Codable, Identifiable {
+    let id: UUID
+    var name: String
+    var entries: [PaperEditEntry]
+}
+
+/// References a Highlight by `(dailyID, highlightID)` rather than embedding a copy — `dailyID` is
+/// carried explicitly (not re-derived by scanning every folder's every daily for a matching
+/// highlight ID) since it's needed to resolve playback (source media URL) and display (Daily
+/// name, transcript lookup) without ambiguity. If the underlying Highlight or Daily is later
+/// deleted, `ProjectController.removeHighlight`/`deleteDaily`/`deleteFolder` all cascade-clean any
+/// entries that would otherwise dangle — see their doc comments.
+struct PaperEditEntry: Codable, Identifiable {
+    let id: UUID
+    var dailyID: UUID
+    var highlightID: UUID
 }
 
 enum ProjectError: LocalizedError {
@@ -134,8 +203,12 @@ final class ProjectController: ObservableObject {
 
     /// Copies `sourceURL` into the given folder as a new Daily and returns both the Daily and the
     /// URL it now lives at (so the caller — transcription — doesn't need to re-derive the path).
+    /// `async` (not throws-only) to capture a video Daily's frame rate via
+    /// `AVAssetTrack.load(.nominalFrameRate)` — groundwork for the next phase's EDL export, which
+    /// needs it for timecode conversion (spec §8). Nil for audio-only dailies or if extraction
+    /// fails; failure is non-fatal (`try?`), a missing frame rate shouldn't block adding the Daily.
     @discardableResult
-    func addDaily(from sourceURL: URL, to folderID: UUID) throws -> (daily: Daily, mediaURL: URL) {
+    func addDaily(from sourceURL: URL, to folderID: UUID) async throws -> (daily: Daily, mediaURL: URL) {
         guard let rootURL, let folder = metadata?.folders.first(where: { $0.id == folderID }) else {
             throw ProjectError.folderNotFound
         }
@@ -145,12 +218,18 @@ final class ProjectController: ObservableObject {
         let destURL = rootURL.appendingPathComponent(folder.name).appendingPathComponent(mediaFilename)
         try FileManager.default.copyItem(at: sourceURL, to: destURL)
 
+        var frameRate: Double?
+        if AudioPlaybackController.videoExtensions.contains(ext.lowercased()) {
+            frameRate = await Self.nominalFrameRate(of: destURL)
+        }
+
         let daily = Daily(
             id: dailyID,
             displayName: sourceURL.deletingPathExtension().lastPathComponent,
             mediaFilename: mediaFilename,
             addedAt: Date(),
-            transcript: Transcript(segments: [])
+            transcript: Transcript(segments: []),
+            frameRate: frameRate
         )
         guard let folderIndex = metadata?.folders.firstIndex(where: { $0.id == folderID }) else {
             throw ProjectError.folderNotFound
@@ -163,6 +242,13 @@ final class ProjectController: ObservableObject {
         return (daily, destURL)
     }
 
+    private static func nominalFrameRate(of url: URL) async -> Double? {
+        let asset = AVURLAsset(url: url)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first else { return nil }
+        guard let rate = try? await track.load(.nominalFrameRate), rate > 0 else { return nil }
+        return Double(rate)
+    }
+
     func updateDailyTranscript(_ dailyID: UUID, segments: [TranscriptSegment]) {
         guard let folderIndex = metadata?.folders.firstIndex(where: { folder in
             folder.dailies.contains { $0.id == dailyID }
@@ -172,9 +258,36 @@ final class ProjectController: ObservableObject {
         try? save()
     }
 
+    func addHighlight(_ highlight: Highlight, to dailyID: UUID) {
+        guard let folderIndex = metadata?.folders.firstIndex(where: { folder in
+            folder.dailies.contains { $0.id == dailyID }
+        }) else { return }
+        guard let dailyIndex = metadata?.folders[folderIndex].dailies.firstIndex(where: { $0.id == dailyID }) else { return }
+        metadata?.folders[folderIndex].dailies[dailyIndex].highlights.append(highlight)
+        try? save()
+        AudiumLog.project.info("Highlight added to daily \(dailyID.uuidString, privacy: .public)")
+    }
+
+    /// Removes the Highlight and cascades to any Paper Edit entries that reference it — an entry
+    /// pointing at a deleted Highlight would otherwise dangle (nothing to resolve its
+    /// timestamp/text from). Removing an entry from a Paper Edit does *not* delete the underlying
+    /// Highlight (see `removeEntry`) — this is the one direction that does cascade, since a
+    /// Highlight is the thing an entry exists to reference.
+    func removeHighlight(_ highlightID: UUID, from dailyID: UUID) {
+        guard let folderIndex = metadata?.folders.firstIndex(where: { folder in
+            folder.dailies.contains { $0.id == dailyID }
+        }) else { return }
+        guard let dailyIndex = metadata?.folders[folderIndex].dailies.firstIndex(where: { $0.id == dailyID }) else { return }
+        metadata?.folders[folderIndex].dailies[dailyIndex].highlights.removeAll { $0.id == highlightID }
+        removeDanglingPaperEditEntries { $0.highlightID == highlightID }
+        try? save()
+        AudiumLog.project.info("Highlight removed from daily \(dailyID.uuidString, privacy: .public)")
+    }
+
     /// Deletes the folder's on-disk directory (and every Daily's media inside it) plus its
-    /// metadata entry. Clears `selectedFolderID`/`selectedDailyID` if they pointed inside it, so
-    /// the UI doesn't keep referencing a folder that no longer exists.
+    /// metadata entry. Clears `selectedFolderID`/`selectedDailyID` if they pointed inside it, and
+    /// cascades to any Paper Edit entries referencing a Daily that lived in this folder, for the
+    /// same dangling-reference reason as `removeHighlight`.
     func deleteFolder(_ folderID: UUID) throws {
         guard let rootURL, let folder = metadata?.folders.first(where: { $0.id == folderID }) else {
             throw ProjectError.folderNotFound
@@ -185,13 +298,16 @@ final class ProjectController: ObservableObject {
         if let selectedDailyID, folder.dailies.contains(where: { $0.id == selectedDailyID }) {
             self.selectedDailyID = nil
         }
+        let deletedDailyIDs = Set(folder.dailies.map(\.id))
+        removeDanglingPaperEditEntries { deletedDailyIDs.contains($0.dailyID) }
         try save()
         AudiumLog.project.info("Folder deleted: \(folder.name, privacy: .public)")
     }
 
     /// Deletes one Daily's media file and metadata entry from its folder. The media removal is
     /// best-effort (`try?`) — a missing file on disk shouldn't block clearing the (authoritative)
-    /// metadata entry.
+    /// metadata entry. Cascades to any Paper Edit entries referencing this Daily, same reasoning
+    /// as `removeHighlight`.
     func deleteDaily(_ dailyID: UUID, from folderID: UUID) throws {
         guard let folderIndex = metadata?.folders.firstIndex(where: { $0.id == folderID }) else {
             throw ProjectError.folderNotFound
@@ -202,6 +318,7 @@ final class ProjectController: ObservableObject {
         try? FileManager.default.removeItem(at: mediaURL(for: daily, in: folder))
         metadata?.folders[folderIndex].dailies.remove(at: dailyIndex)
         if selectedDailyID == dailyID { selectedDailyID = nil }
+        removeDanglingPaperEditEntries { $0.dailyID == dailyID }
         try save()
         AudiumLog.project.info("Daily deleted: \(daily.displayName, privacy: .public)")
     }
@@ -211,6 +328,58 @@ final class ProjectController: ObservableObject {
     /// already has a `ProjectFolder` in hand from iterating `metadata.folders`.
     func mediaURL(for daily: Daily, in folder: ProjectFolder) -> URL {
         rootURL!.appendingPathComponent(folder.name).appendingPathComponent(daily.mediaFilename)
+    }
+
+    // MARK: - Paper Edit (spec §8: the assembled "selects" reel)
+
+    @discardableResult
+    func addPaperEdit(name: String) -> PaperEdit {
+        let paperEdit = PaperEdit(id: UUID(), name: name, entries: [])
+        metadata?.paperEdits.append(paperEdit)
+        try? save()
+        AudiumLog.project.info("Paper Edit created: \(name, privacy: .public)")
+        return paperEdit
+    }
+
+    func deletePaperEdit(_ paperEditID: UUID) {
+        metadata?.paperEdits.removeAll { $0.id == paperEditID }
+        try? save()
+        AudiumLog.project.info("Paper Edit deleted")
+    }
+
+    /// Appends a new entry referencing `highlightID`/`dailyID` — does not validate that the
+    /// Highlight still exists (callers already have one in hand, from the Highlights list this is
+    /// wired to), matching the rest of this class's "trust the caller, it's all in-process UI
+    /// state" style.
+    func addPaperEditEntry(highlightID: UUID, dailyID: UUID, to paperEditID: UUID) {
+        guard let index = metadata?.paperEdits.firstIndex(where: { $0.id == paperEditID }) else { return }
+        metadata?.paperEdits[index].entries.append(PaperEditEntry(id: UUID(), dailyID: dailyID, highlightID: highlightID))
+        try? save()
+        AudiumLog.project.info("Paper Edit entry added")
+    }
+
+    /// Removes just this entry — deliberately does *not* touch the underlying Highlight (spec:
+    /// "removing from the Paper Edit should NOT delete the underlying Highlight — they're
+    /// independent").
+    func removePaperEditEntry(_ entryID: UUID, from paperEditID: UUID) {
+        guard let index = metadata?.paperEdits.firstIndex(where: { $0.id == paperEditID }) else { return }
+        metadata?.paperEdits[index].entries.removeAll { $0.id == entryID }
+        try? save()
+    }
+
+    /// Backs the Paper Edit view's drag-to-reorder — same `(IndexSet, Int)` shape SwiftUI's
+    /// `List.onMove` already hands callers, so the view layer needs no translation.
+    func movePaperEditEntries(in paperEditID: UUID, from offsets: IndexSet, to destination: Int) {
+        guard let index = metadata?.paperEdits.firstIndex(where: { $0.id == paperEditID }) else { return }
+        metadata?.paperEdits[index].entries.move(fromOffsets: offsets, toOffset: destination)
+        try? save()
+    }
+
+    private func removeDanglingPaperEditEntries(matching shouldRemove: (PaperEditEntry) -> Bool) {
+        guard let paperEdits = metadata?.paperEdits else { return }
+        for i in paperEdits.indices {
+            metadata?.paperEdits[i].entries.removeAll(where: shouldRemove)
+        }
     }
 
     private func save() throws {

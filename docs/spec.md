@@ -193,6 +193,41 @@ flat `.cornerRadius(8)` cards).
   with WhisperKit pre-selected out of the box but user can change it freely
 
 **Known issue (deferred, not blocking):**
+- **SwiftUI `VideoPlayer` crashes on first render, real GUI (2026-07-26)** — dropping a video
+  file crashed with `EXC_CRASH`/`SIGABRT`, a Swift runtime `fatalError` inside
+  `getSuperclassMetadata`/generic metadata instantiation for `_AVKit_SwiftUI` (the private
+  framework backing SwiftUI's `VideoPlayer`). Investigated across two separate crash reports
+  before landing on the real cause:
+  1. First report: the crashing main thread (first `VideoPlayer` render) coincided with a
+     background "coremedia queue" thread running `AVAssetExportSession.init` from
+     `extractedAudioURL(from:)` — looked like a Swift generic-metadata-cache race between two
+     first-touches of overlapping AVFoundation/AVKit-SwiftUI metadata on different threads.
+     Root cause of *that* specific concurrency: `extractedAudioURL` was a plain free function
+     with no actor annotation, and per Swift concurrency rules, calling a non-isolated async
+     function from `@MainActor` code (`ContentView.runTranscription`) runs the callee's body on
+     the global concurrent executor, not the caller's thread — so it really was running
+     concurrently with `runTranscription`'s prior `playback.load(url:)` call, which sets
+     `AudioPlaybackController.avPlayer` and schedules `VideoPlayer`'s first render. Fixed by
+     marking `extractedAudioURL` `@MainActor`, serializing both onto one thread.
+  2. Retested (real GUI, same clip, multiple drops): crashed again, **same exact signature**,
+     but the concurrent background activity was completely different this time
+     (`AVCaptureProprietaryDefaultsSingleton`/CoreAudio HAL init, unrelated to Audium's own
+     extraction code). This ruled out the race-with-extraction theory — two different concurrent
+     culprits producing the identical crash signature means the crash is inside `VideoPlayer`'s
+     own bridging layer itself on this OS build, not caused by anything Audium's code does
+     concurrently around it. The `@MainActor` fix above is still correct (real race, real fix)
+     but wasn't the cause of the crash — it just wasn't sufficient, since `VideoPlayer` itself is
+     unsafe to first-render here regardless of what else is happening on other threads.
+  **Fixed — confirmed via real drag-and-drop (2026-07-26)**: replaced SwiftUI's `VideoPlayer` with AppKit's `AVPlayerView`
+  wrapped via `NSViewRepresentable` (`PlayerView` in `ContentView.swift`, next to
+  `WaveformBarsView`) — `AVPlayerView` is the older, stable AppKit control and never touches the
+  `_AVKit_SwiftUI` bridge at all. `controlsStyle = .inline` keeps AVKit's native floating
+  play/pause/scrub-bar overlay, satisfying the "scrubbing carries over" requirement (spec §8)
+  for free rather than reimplementing a custom drag-to-scrub gesture over raw video like
+  `WaveformBarsView` does for audio bars. The underlying `AVPlayer` object, its periodic
+  time-observer (transcript sync), and `timeControlStatus` KVO (keeps the custom play/pause
+  button's icon in sync with AVKit's own native controls) are all unchanged — only the view
+  layer wrapping the same player object changed.
 - WhisperKit crashes with SIGSEGV on Intel Macs (no Neural Engine) — `TextDecoder.swift:139`,
   KV-cache tensor allocation via `.float16` IOSurface-backed initializer, happens before
   CoreML compute-unit dispatch so `ModelComputeOptions` can't route around it. Confirmed on
@@ -482,15 +517,318 @@ controls (buttons, `.alert`, `.confirmationDialog`) remain fully automatable via
 positional element paths, as does regular text-field entry — this limitation is specific to
 system-level Powerbox panels and cross-application drag-and-drop.
 
-### Video playback (upgraded from audio-only)
+### Video playback (upgraded from audio-only) — implemented (2026-07-26)
 
-- Current `AudioPlaybackController` (AVAudioFile/AVAudioPlayer) is audio-only — v2 needs real
-  video preview + scrubbing (user decision: full video preview/scrubbing required, not just
-  audio-sync). Replace/extend with `AVPlayer` + `AVPlayerLayer`/`VideoPlayer` (SwiftUI) for
-  video files; audio-only dailies still use the existing waveform view. Scrubbing, play/pause,
-  and transcript-sync (click-to-seek, playhead-follows-highlight) all carry over from the v1
-  implementation, just need to work against `AVPlayer`'s time-observation API instead of
-  polling `AVAudioPlayer.currentTime`.
+`AudioPlaybackController` (`AudioPlayback.swift`) now dual-mode: audio files still use the
+original `AVAudioPlayer` + extracted-waveform path; video files (`.mp4`/`.mov`/`.m4v`/`.avi`/
+`.mkv`/`.webm`, `AudioPlaybackController.videoExtensions`) use `AVPlayer` instead, with a periodic
+time observer driving `currentTime` (transcript sync/click-to-seek reuses the same `seek(to:)`
+API either way) and a `timeControlStatus` KVO observation keeping `isPlaying` accurate regardless
+of whether playback was toggled via Audium's own button or AVKit's native controls.
+
+Original plan called for SwiftUI's `VideoPlayer` as the view layer — **changed to AppKit's
+`AVPlayerView` wrapped via `NSViewRepresentable`** (`PlayerView` struct in `ContentView.swift`)
+after `VideoPlayer` crashed on first render with a SIGABRT inside `_AVKit_SwiftUI`'s generic
+metadata instantiation on this OS build — see spec §5 Known Issues for the full investigation
+(ruled out a race in Audium's own code; the bridging layer itself is unsafe to first-render here).
+`AVPlayerView`'s `controlsStyle = .inline` gives native scrubbing/play-pause for free. Video and
+audio dailies both drop into the same `WaveformPanel`/waveform-vs-preview area, switching on
+`playback.isVideo`; the panel title switches between "Waveform" and "Preview" accordingly.
+
+Transcription: every `TranscriptionProvider` reads its input as a plain audio file, which can't
+open a multiplexed video container — `extractedAudioURL(from:)` (`TranscriptionProvider.swift`)
+exports just the audio track to a temp `.m4a` via `AVAssetExportSession` first, for video dailies
+only (audio dailies pass through unchanged). This function is `@MainActor`-pinned — not for UI
+safety, but because a non-actor-isolated async function called from `@MainActor` code runs on the
+global concurrent executor rather than the caller's thread (see spec §5 Known Issues); that
+mattered while `VideoPlayer` was still in play, and is left in place as the correct fix for that
+specific concurrency question even after moving off `VideoPlayer`.
+
+### Highlight marking — implemented (2026-07-26)
+
+`Highlight` (`Project.swift`, alongside `ProjectMetadata`/`Daily`) fleshed out from Phase 2's bare
+`{ id: UUID }` stub to: `id`, `start`/`end` (`TimeInterval`), optional `note: String?`,
+`createdAt: Date`. Anchored to `start`/`end` timestamps rather than `TranscriptSegment.id`
+(regenerated fresh on every `Codable` decode — deliberately excluded from that type's own
+encoding, see its doc comment) or an array index (unstable across a re-transcribe, which fully
+replaces `Transcript.segments`). Single-segment for this pass — `start`/`end` mirror one
+highlighted segment exactly, matching the simpler of the two selection mechanisms considered
+(per-segment vs. drag-to-select a cross-segment range); a future multi-segment range is just a
+wider `start`/`end` pair spanning several segments, no format change needed. No separate
+`tag`/`color` field — the app's design language deliberately uses one accent color throughout (see
+`WaveformBarsView`'s doc comment), so there's no second hue for a color picker to choose between.
+
+**UI** (`ContentView.swift`):
+- `SegmentRow` gained a star button (`star`/`star.fill`) toggling that segment's highlight —
+  disabled/dimmed (not hidden, keeps row layout stable) for a standalone no-project file, since a
+  Highlight needs a Daily to attach to (same constraint `Re-transcribe`'s `dailyID` already
+  follows). Highlighted segments also get a 3pt leading accent-color stripe (`.overlay(alignment:
+  .leading)`) — deliberately a *different* visual than the existing "currently playing" full-row
+  tint (`isCurrent`, `Theme.accent.opacity(0.14)`), so a segment that's both playing and
+  highlighted at once reads as two distinct states, not a double-strength version of one state.
+- `HighlightsMenu`/`HighlightsListView` — a small "★ N" count badge in the Transcript panel header
+  (next to `ExportMenu`, same "click to reveal a lightweight popover list" shape), listing every
+  highlight for the current Daily sorted by `start`: timestamp (click to seek), the matched
+  segment's text (looked up by `start`, same identity rule as the toggle), and a remove button.
+  Not the full Paper Edit assembly view (spec's next phase) — just enough to see/navigate/remove
+  what's been marked so far, per this phase's scope.
+- `ProjectController.addHighlight(_:to:)`/`removeHighlight(_:from:)` — same
+  find-folder-then-find-daily-then-mutate-then-`save()` shape as `updateDailyTranscript`.
+  `ContentView.currentHighlights` is a computed property reading straight from
+  `project.metadata` (not mirrored into separate `@State`) so it can't drift out of sync with the
+  persisted data.
+
+**Real GUI test** (signed `build/Audium.app`, same AXPress/positional-element-path methodology as
+every other phase's smoke test): reused the Phase 2 smoke-test project
+("Audium Smoke Test Project"), seeding one Daily's transcript with 3 segments directly on disk
+(splitting its existing single-segment dialogue into 3 sentences with distinct timestamps —
+legitimate test-data setup, not a shortcut around the feature under test, same precedent as
+Phase 2 seeding a project's initial JSON since NSSavePanel confirmation isn't automatable).
+Marked all 3 segments as highlights via their star buttons — confirmed via `log show`
+(`Highlight added to daily ...` ×3) and on-disk JSON (`start`/`end` matching all 3 segments
+exactly). Removed the middle highlight via the popover's trash button — confirmed via `log show`
+(`Highlight removed from daily ...`) and on-disk JSON (2 remain, correct ones). Fully quit
+(`osascript ... quit`, process confirmed gone) → relaunched → reopened via Recent → reselected the
+Daily → reopened the Highlights popover: both surviving highlights present with correct text
+("Where were you last night?" / "Ask anyone who was there.") and correct order, the removed one
+("I told you, I was at the restaurant the whole time.") correctly still gone. Full round-trip
+persistence confirmed, same rigor as Phase 2's project data-model test.
+
+### Paper Edit assembly — implemented (2026-07-26)
+
+The actual deliverable this whole v2 direction exists to produce (spec intro, §8). Data model in
+`Project.swift`, UI in the new `PaperEditView.swift`.
+
+**Data model**: `PaperEdit` (`id`, `name`, `entries: [PaperEditEntry]`) and `PaperEditEntry`
+(`id`, `dailyID`, `highlightID`) — an entry references a Highlight by ID rather than copying its
+text/timestamps, so edits to the underlying transcript/highlight propagate automatically.
+`dailyID` is carried explicitly on the entry (not re-derived by scanning every folder) since it's
+needed to resolve playback (source media URL) and display without ambiguity. **Multiple named
+Paper Edits per project**, not just one — real editorial workflow wants more than a single
+assembly from the same dailies (e.g. a "selects" reel vs. a tighter cut), and supporting an array
+instead of a single value cost nothing extra in the model. `ProjectController` gained
+`addPaperEdit`/`deletePaperEdit`/`addPaperEditEntry`/`removePaperEditEntry`/
+`movePaperEditEntries` (the last matches `List.onMove`'s `(IndexSet, Int)` shape directly, no
+translation needed at the view layer) — same find-then-mutate-then-`save()` shape as every other
+`ProjectController` method.
+
+**Cascade cleanup**: deleting a Highlight, Daily, or Folder now also removes any Paper Edit
+entries that referenced it (`removeDanglingPaperEditEntries` helper, called from
+`removeHighlight`/`deleteDaily`/`deleteFolder`) — otherwise a deleted Highlight would leave a
+dangling entry with nothing to resolve its timestamp/text from. Removing an entry *from* a Paper
+Edit does **not** delete the underlying Highlight — that direction stays independent, per spec.
+
+**UI**: a separate window (`Window("Paper Edit", id: "paperEdit")` in `AudiumApp.swift`,
+opened via a new toolbar button and Cmd+Shift+P), not a 5th bento panel — the existing 4-panel
+layout (project tree · waveform/preview · transcript · AI chat) is already tight at the window's
+minWidth, and reviewing/reordering a Paper Edit is a distinct editorial task rather than something
+used moment-to-moment alongside transcription. Sidebar lists every Paper Edit in the project
+(create/delete); the main area lists the selected one's entries (Daily name, timestamp range,
+highlighted text), reorderable via SwiftUI's native `List.onMove` drag — the native platform
+mechanism, not a hand-rolled drag gesture. "Add to Paper Edit" lives in the existing Highlights
+popover (`ContentView.swift`) as a per-highlight menu: pick an existing Paper Edit or "New Paper
+Edit…", which creates one inline.
+
+**Playback reuses the existing wiring, not duplicated**: `ProjectController` and
+`AudioPlaybackController` were promoted from `ContentView`'s own `@StateObject`s to
+`AudiumApp`-level `@StateObject`s, injected into both the main `WindowGroup` and the new `Window`
+via `.environmentObject` (SwiftUI's environment doesn't cross Scene boundaries on its own, so each
+Scene's root needs its own `.environmentObject` call against the same instances). Clicking a Paper
+Edit entry's play button calls the same `mediaURL(for:in:)` → `playback.load(url:)` →
+`playback.seek(to:)` → `playback.play()` sequence any sidebar Daily click already goes through —
+confirmed live via the shared engine: playing an entry from the Paper Edit window visibly loads
+and plays in the *main* window's Waveform/Preview panel (real GUI test, see below).
+
+**Deliberate v1 scope boundary** (not a bug): playing a Paper Edit entry does *not* also update
+the main window's Transcript panel — `segments`/`currentDailyID` are private `@State` on
+`ContentView`, not shared state, so only the Waveform/Preview panel (driven by the shared
+`playback` object) follows along. Promoting that state too would be a bigger change than this pass
+called for; noted here rather than silently left inconsistent.
+
+**Deliberately not built this pass**: sequential "play the whole Paper Edit in order"
+(auto-advance). Each entry can come from a different Daily/media file, so auto-advance means
+detecting an entry's end via the time observer, then loading + seeking the *next* entry's file
+gaplessly — a real state machine, not a one-line addition. Reasonable v2.1 addition; clicking an
+entry to play from its start covers this pass's actual requirement.
+
+**Frame rate groundwork** (spec: needed for the next phase, EDL export, without retrofitting
+later): `Daily` gained `frameRate: Double?` — nil for audio-only dailies. Not left purely as an
+inert field for later backfill: `ProjectController.addDaily` now `async` (was throws-only) and
+opportunistically captures it for video dailies via `AVAssetTrack.load(.nominalFrameRate)`
+(`Self.nominalFrameRate(of:)`), non-fatally (`try?`) so extraction failure doesn't block adding
+the Daily. Capturing it now, rather than leaving every field nil until EDL export lands, avoids
+every video Daily added in between needing a separate backfill pass.
+
+**Bugs found via this live testing and fixed (both real, both in the same pass):**
+- **Missing-key decode failure on older project files**: adding `ProjectMetadata.paperEdits:
+  [PaperEdit] = []` broke opening *any* project JSON saved before this change — real GUI test,
+  first attempt to open the Phase 2 smoke-test project threw and showed "The data couldn't be
+  read because it is missing." Root cause: Swift's synthesized `Decodable` does **not** fall back
+  to a stored property's `= []` default for a genuinely-missing key — only `Optional` properties
+  decode a missing key as `nil` automatically. Every pre-existing project file lacked the
+  `"paperEdits"` key outright. Fixed with a custom `init(from:)` using
+  `decodeIfPresent(...) ?? []` for that one field (the rest stay on the synthesized path via an
+  explicit memberwise `init` alongside it). `Daily.highlights`/`Daily.frameRate` didn't need the
+  same fix — `highlights` predates any real project file ever written (always present), and
+  `frameRate` is `Optional`, which synthesized decode already handles correctly.
+- **Drag-to-reorder silently did nothing**: `PaperEditEntryRow` originally wrapped the *whole
+  row* in `.contentShape(Rectangle()).onTapGesture { onPlay() }` (matching the "click entry to
+  play" requirement) — but on macOS, a tap gesture covering a `List` row's full area blocks
+  `.onMove`'s native reorder-drag from ever engaging, since both claim the same touch. Real GUI
+  test confirmed: multiple careful drag attempts (varied speed, added an explicit focus click
+  first) produced zero movement. Fixed by scoping the play action to a real `Button` around just
+  the row's leading play icon, leaving the rest of the row free for the List's native drag.
+  Confirmed fixed after a human performed the drag (`cliclick`-synthesized drags don't reliably
+  trigger `List`'s native reorder session either — see the new permanent note below) — order
+  change verified on disk and visually, then reconfirmed surviving a full quit/relaunch.
+
+**Real GUI test** (signed `build/Audium.app`, same methodology as every other phase): reused the
+Phase 2/3 smoke-test project. Seeded a 3rd highlight on `interview_clip` (starred its one segment)
+so the Paper Edit could span two different Dailies, not just multiple highlights within one.
+Added all 3 highlights to a newly-created "Paper Edit 1" via the Highlights popover's per-entry
+menu (first entry: "New Paper Edit…"; remaining two: selecting the now-existing "Paper Edit 1" —
+confirmed via `log show`: one `Paper Edit created` line, two `Paper Edit entry added` lines).
+Opened the Paper Edit window (toolbar button): all 3 entries listed with correct Daily
+name/timestamp range/text, in add order. A human performed the one drag-reorder (see permanent
+note below); confirmed the resulting order both on-disk (`.audiumproject.json`) and visually.
+Fully quit → relaunched → reopened project → reopened Paper Edit window: reordered sequence
+identical to pre-quit state, full persistence round-trip confirmed. Clicked an entry's play
+button: confirmed (screenshot) the main window's Waveform panel loaded that entry's Daily,
+seeked to its start, and began playing (pause icon, elapsed time advancing) — the shared-engine
+playback wiring works correctly end-to-end.
+
+### Permanent note: SwiftUI `List` drag-to-reorder on macOS doesn't respond to synthetic (`cliclick`) drag events
+
+Distinct from the existing Powerbox/Finder-drag limitation above (this is an ordinary in-app
+control, not a system panel or cross-app drag) but empirically just as non-automatable in this
+environment. Tried: a basic 3-step `cliclick dd/dm/du` drag; a slower multi-step drag with pauses
+between each intermediate point; the same with an explicit window-focus click first. All produced
+zero movement, identically, across every attempt — no partial/flaky success. AXPress-style
+`.click()` isn't applicable here since reordering is inherently a drag, not a discrete
+press. **Implication for future sessions**: any task requiring a `List`/table drag-reorder needs a
+human at the mouse for that one step, same workflow as the Finder-drag note — ask directly, then
+resume automated verification (on-disk JSON, screenshots, `log show`) once they confirm it's done.
+Ordinary button/control clicks inside the same `List` (e.g. a row's own play/remove buttons)
+remain fully automatable via AXPress — this is specific to the reorder-drag gesture itself. Also
+worth noting for future AX automation in any `List`: each row is wrapped in an `AXCell` (standard
+for `List`'s `NSTableView` backing on macOS) — a row's actual controls sit *one level deeper* than
+they would in a plain `VStack`/`HStack` (`row → AXCell → actual button`), not directly at the row
+level. Getting this depth wrong doesn't error, it just silently clicks the inert `AXCell` instead
+of the real control — confirmed this exact mistake mid-session (see the Paper Edit playback bug
+write-up above, which turned out to be a test-automation bug, not an app bug, once the correct
+depth was used).
+
+### EDL export (CMX3600) — implemented (2026-07-26)
+
+Targets real Avid Media Composer import compatibility (spec §9's original wording). Implementation
+in the new `EDLExporter.swift`, mirroring `Exporter.swift`'s render/write/`NSSavePanel` pattern in
+its own file since the CMX3600 domain (timecode/drop-frame/reel-name math) is substantial. Export
+button ("Export EDL…", `AccentButtonStyle`) lives in `PaperEditView`'s entries header.
+
+**Research performed before writing any code** (per explicit instruction — this needed to be
+right on a first real Avid import attempt, not trial-and-error). Live web research, not assumed
+from training-data recollection, cross-checked across multiple independent sources:
+
+- **Reel names**: CMX3600 reel/source names are limited to 8 characters, alphanumeric A-Z/0-9
+  only (a holdover from physical tape-reel labeling on the original CMX hardware) — confirmed via
+  [edlmax.com's EDL guide](https://edlmax.com/EdlMaxHelp/Edl/maxguide.html) and corroborated by
+  [Wikipedia's EDL article](https://en.wikipedia.org/wiki/Edit_decision_list) (noting Final Cut
+  Pro's CMX3600 export enforces the same 8-char limit even though Avid's own *native* project
+  format allows up to 32 chars — the constraint is CMX3600's, not Avid's, but since we're writing
+  CMX3600, 8 chars is what applies). "AX" is the documented placeholder for a clip with no usable
+  reel name (a file rather than a tape/camera reel).
+- **"* FROM CLIP NAME:" comment convention** for preserving the real name past the 8-char
+  truncation — confirmed as a real, current convention (not invented) via
+  [OpenTimelineIO's `otio-cmx3600-adapter`](https://github.com/OpenTimelineIO/otio-cmx3600-adapter)
+  source, a maintained reference EDL writer used across the industry (Netflix and others). Its
+  actual write-path format string: `"* {FROM|TO} CLIP NAME:  {name}"` (two spaces after the
+  colon) — replicated verbatim.
+- **Event line layout**: event number (3-digit) · reel (8-char field) · track/channel code ·
+  edit type · source in/out · record in/out, cross-checked against the same OTIO source's literal
+  format string (`"{edit:03d}  {reel:8} {kind:5} C        {src_in} {src_out} {rec_in} {rec_out}"`,
+  cut-only — no dissolve/wipe support needed since a Paper Edit is a straight assembly, no
+  transition data exists in the model) and against
+  [CutConvert's EDL guide](https://cutconvert.com/guides/what-is-an-edl). Track/channel codes
+  confirmed: `V` video-only, `A`/`A2` audio channel(s), `B` video+audio1 (the standard code for a
+  plain synced video+audio cut) — this app emits `A` for audio-only Dailies, `B` for video Dailies
+  (every video Daily has an embedded audio track; there's no video-only case to emit `V` for).
+- **FCM (Frame Code Mode) line**: `FCM: NON-DROP FRAME` / `FCM: DROP FRAME`, confirmed via
+  CutConvert's guide ("Get this wrong and every record timecode drifts") and Wikipedia. SMPTE
+  258M allows FCM to appear again before any later event to switch modes mid-document, not just
+  once at the top — confirmed by OTIO's reader parsing per-event FCM — which this exporter uses:
+  it emits a new FCM line only when an event's drop/non-drop mode differs from the previous one,
+  not unconditionally per event.
+- **Drop-frame timecode conversion**: CMX3600/SMPTE timecode has **no numeric frame-rate field
+  anywhere in the format** — only the DF/NDF mode flag, since the receiving system's own project
+  settings supply the actual numeric rate, and DF/NDF is the *only* thing that changes how frame
+  numbers are counted (relevant solely to the 29.97/59.94 NTSC family, which isn't exactly 30/60fps
+  and drifts from wall-clock time by ~3.6 sec/hour if not corrected — confirmed via multiple
+  sources including a [SMPTE timecode explainer](https://www.davidheidelberger.com/2010/06/10/drop-frame-timecode/)).
+  Drop-frame timecode conventionally uses a semicolon (`;`) before the frames field instead of a
+  colon, visually flagging DF at a glance — confirmed via a
+  [Blackmagic forum thread](https://forum.blackmagicdesign.com/viewtopic.php?t=96031) on
+  DF/NDF conversion workflows. **Conversion algorithm**: Andrew Duncan's drop-frame algorithm as
+  published by [David Heidelberger](https://www.davidheidelberger.com/2010/06/10/drop-frame-timecode/)
+  — frame numbers 0 and 1 are skipped at the start of every minute except every 10th, computed via
+  `framesPer10Minutes`/`framesPerMinute`/`dropFramesPerMinute` — implemented verbatim in
+  `EDLExporter.dropFrameComponents`. Naively treating 29.97 as flat 30fps (skipping this
+  correction) is exactly the "EDL imports with wrong timing" bug class called out in the task —
+  avoided by implementing the real algorithm, not a shortcut.
+
+**Design decision, not explicitly covered by research**: a Paper Edit can span Dailies of
+different (or absent, audio-only) frame rates, but CMX3600 fundamentally has no way to declare a
+numeric rate at all (per the point above) — so "mixed frame rates in one EDL" isn't really a
+format feature to support or fail to support, it's a non-concept. Each event's *own* rate governs
+both its source and record timecode columns (keeping one event line internally FCM-consistent);
+real elapsed record time is tracked in seconds and only converted to frame notation per event, so
+consecutive events at different rates still line up exactly in real time at their cut points —
+only the FF digits differ there, which is exactly how a real mixed-rate EDL looks, not a bug.
+Entries with no captured `frameRate` (audio-only Dailies) fall back to 30fps non-drop, the
+conventional safe default for audio-only EDL content.
+
+**Bugs found via live testing and fixed (three, all in this pass):**
+- **Drop-frame tolerance too loose**: `isDropFrame(rate:)`'s original `0.05` tolerance
+  misclassified an exact `30.0`fps rate as drop-frame (`|30 − 29.97| = 0.03 < 0.05`). Caught
+  *before* ever touching the GUI, via a standalone command-line harness
+  (`swiftc EDLExporter.swift AudiumLog.swift main.swift`, synthetic entries covering audio/video/
+  drop-frame/collision cases, run outside the app) — exactly the kind of naive-DF-handling bug the
+  task called out as a real risk. Fixed by tightening to `0.01`.
+- **Double file extension**: `NSSavePanel.nameFieldStringValue` was pre-set to `"<name>.edl"`
+  *and* `allowedContentTypes` was also set to append `.edl`, producing `"Paper Edit 1.edl.edl"` in
+  the real save panel — caught via real GUI test (screenshot of the actual panel). Fixed by
+  passing just the base name and letting `allowedContentTypes` supply the one extension, matching
+  how `NSSavePanel` is meant to be driven.
+- **Same Daily got a different reel name each time it appeared** (a Paper Edit commonly pulls
+  multiple highlights from one Daily) — the reel-name allocator treated every `allocate` call as
+  needing a fresh unique slot rather than reusing what that Daily was already assigned, so two
+  highlights from `scene1_take2` exported as reels `SCENE1TA` and `SCENE101` instead of both being
+  `SCENE1TA`. This would actively break a real Avid relink (two different reel names read as two
+  different source files). Caught via the real exported file's content, not just structural
+  skimming. Fixed by keying the allocator on `Daily.id` (added to `EDLExporter.Entry`) and
+  memoizing the assigned name per Daily, only disambiguating collisions between *different*
+  Dailies.
+
+**Real GUI test** (signed `build/Audium.app`): exported from the existing 3-entry/2-Daily Paper
+Edit (`interview_clip` + `scene1_take2` ×2, all audio-only `.aiff` — this project's current test
+data has no video Dailies, so the real export exercises the non-drop-frame/audio path only; the
+drop-frame and mixed-rate paths were verified via the standalone harness above instead, with
+synthetic entries at 29.97/59.94/25fps and a manufactured minute-boundary crossing). A human
+completed the `NSSavePanel` confirm (not synthetically automatable — see the permanent note
+above). Resulting file manually verified line-by-line against everything researched above: title
+line, single `FCM: NON-DROP FRAME` declaration, 3 correctly-numbered events, correct reel names
+(`INTERVIE`, `SCENE1TA` reused for both `scene1_take2` events), correct `A` track code
+(audio-only), correct cut type, source/record timecodes hand-recomputed and matched exactly, `*
+FROM CLIP NAME:` present on every event with the real filename, plus a supplementary (non-standard
+but harmless, comment-only) line with the highlighted text for human readability.
+
+**Confidence level, stated explicitly per the task's instruction**: this is
+**structurally-verified-but-not-Avid-tested**. Every field matches what was researched and the
+timecode math is verified correct (including via a from-scratch algorithmic re-derivation, not
+just "looks right"), but no actual Avid Media Composer import has been attempted. The user has
+Avid per their toolset — asked whether they're able to test a real import; if so, the specific
+things to check on their end are: reel names appearing correctly, clip names surviving as
+comments/notes, event timing landing on the right frames, and audio-only events importing as
+expected (vs. Avid expecting a video track present).
 
 ### Export additions
 
@@ -710,10 +1048,25 @@ Rough phase order, to be refined as each lands:
 2. Project data model + project browser UI (foundation everything else needs) — **complete
    (2026-07-26)**, real GUI smoke test passed end-to-end. See the dedicated subsection below
    ("Project data model + browser UI — smoke test complete") for full detail.
-3. Video playback upgrade (AVPlayer)
-4. Highlight marking in transcript panel
-5. Paper Edit assembly view + reordering
-6. `.docx` export (transcript + paper edit formats)
+3. Video playback upgrade — **complete (2026-07-26)**, real GUI smoke test passed end-to-end
+   (including a crash investigation and fix along the way — SwiftUI's `VideoPlayer` turned out to
+   be unsafe to first-render on this OS build; replaced with AppKit's `AVPlayerView` via
+   `NSViewRepresentable`). See the dedicated subsection above ("Video playback (upgraded from
+   audio-only) — implemented") and spec §5 Known Issues for full detail.
+4. Highlight marking in transcript panel — **complete (2026-07-26)**, real GUI smoke test passed
+   end-to-end (mark/remove/persist across quit-relaunch). See the dedicated subsection above
+   ("Highlight marking — implemented") for full detail.
+5. Paper Edit assembly view + reordering — **complete (2026-07-26)**, real GUI smoke test passed
+   end-to-end (multi-Daily assembly, drag-reorder, playback through the shared engine, persistence
+   across quit-relaunch). See the dedicated subsection above ("Paper Edit assembly — implemented")
+   for full detail, including two bugs found and fixed during testing and a new permanent note on
+   `List` drag-reorder automation limits.
+6. EDL export (CMX3600, Avid-targeted) — **complete (2026-07-26)**, structurally verified against
+   researched-and-cited format details (not assumed) plus a from-scratch drop-frame algorithm
+   re-derivation; not yet confirmed against a real Avid import. See the dedicated subsection above
+   ("EDL export (CMX3600) — implemented") for full detail, citations, and three bugs found and
+   fixed during testing.
+7. `.docx` export (transcript + paper edit formats)
 
 ## 9. v2 Roadmap — Additional Items (not yet sequenced against Section 8 above)
 

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import AVKit
 import UniformTypeIdentifiers
 import WhisperKit
 import SpeakerKit
@@ -13,7 +14,7 @@ struct ContentView: View {
     @Environment(\.openSettings) private var openSettings
 
     @State private var segments: [TranscriptSegment] = []
-    @State private var status = "Drop an audio file to begin"
+    @State private var status = "Drop an audio or video file to begin"
     @State private var statusFraction: Double?
     @State private var isTranscribing = false
     @State private var transcriptionStartedAt: Date?
@@ -25,36 +26,60 @@ struct ContentView: View {
     /// standalone/no-project file). Lets "Re-transcribe" and folder/daily deletion know which
     /// on-disk Daily — if any — the currently-displayed transcript actually belongs to.
     @State private var currentDailyID: UUID?
-    @StateObject private var playback = AudioPlaybackController()
-    @StateObject private var project = ProjectController()
+    /// Shared with the Paper Edit window (spec §8) — owned by `AudiumApp`, not this view, so both
+    /// windows drive the same playback engine/project state instead of separate copies.
+    @EnvironmentObject private var playback: AudioPlaybackController
+    @EnvironmentObject private var project: ProjectController
+
+    /// User-resizable Waveform/Preview panel height (spec fix: video preview was too small at
+    /// the old fixed 180pt, and needed to be resizable, not just bigger). Persists across
+    /// launches like other UI state in this app (window size, provider selections) — `@AppStorage`
+    /// is the native fit, no need for a hand-rolled UserDefaults wrapper. Default (360) roughly
+    /// doubles the old fixed height, sized for a comfortable video preview without starving the
+    /// Transcript panel below it at the window's minHeight (700, per `AudiumApp.swift`).
+    @AppStorage("com.postproduction.Audium.waveformPanelHeight") private var waveformPanelHeight: Double = 360
+
+    private static let minWaveformHeight: CGFloat = 160
+    private static let minTranscriptHeight: CGFloat = 220
 
     var body: some View {
         HStack(spacing: 16) {
             ProjectBrowserPanel(project: project, onSelectDaily: loadDaily, onDailyDeleted: clearLoadedContentIfMatches)
                 .frame(width: 240)
-            VStack(spacing: 16) {
-                WaveformPanel(
-                    playback: playback,
-                    status: status,
-                    isTargeted: isDropTargeted,
-                    isBusy: isTranscribing,
-                    urlText: $youtubeURLText,
-                    error: youtubeError,
-                    onSubmitURL: { Task { await runYouTubeTranscription(urlString: youtubeURLText) } },
-                    onBrowse: browseForFile,
-                    onRetranscribe: { Task { await retranscribeCurrent() } }
-                )
-                .frame(height: 180)
-                .onDrop(of: [.audio], isTargeted: $isDropTargeted, perform: handleDrop)
-                TranscriptPanel(
-                    segments: $segments,
-                    isTranscribing: isTranscribing,
-                    status: status,
-                    statusFraction: statusFraction,
-                    startedAt: transcriptionStartedAt,
-                    sourceURL: sourceAudioURL,
-                    playback: playback
-                )
+            GeometryReader { geo in
+                let maxWaveformHeight = max(Self.minWaveformHeight, geo.size.height - Self.minTranscriptHeight - 12)
+                let clampedHeight = min(max(CGFloat(waveformPanelHeight), Self.minWaveformHeight), maxWaveformHeight)
+                VStack(spacing: 0) {
+                    WaveformPanel(
+                        playback: playback,
+                        status: status,
+                        isTargeted: isDropTargeted,
+                        isBusy: isTranscribing,
+                        urlText: $youtubeURLText,
+                        error: youtubeError,
+                        onSubmitURL: { Task { await runYouTubeTranscription(urlString: youtubeURLText) } },
+                        onBrowse: browseForFile,
+                        onRetranscribe: { Task { await retranscribeCurrent() } }
+                    )
+                    .frame(height: clampedHeight)
+                    .onDrop(of: [.audiovisualContent], isTargeted: $isDropTargeted, perform: handleDrop)
+                    PanelResizeHandle(height: $waveformPanelHeight, minHeight: Self.minWaveformHeight, maxHeight: maxWaveformHeight)
+                    TranscriptPanel(
+                        segments: $segments,
+                        isTranscribing: isTranscribing,
+                        status: status,
+                        statusFraction: statusFraction,
+                        startedAt: transcriptionStartedAt,
+                        sourceURL: sourceAudioURL,
+                        playback: playback,
+                        highlights: currentHighlights,
+                        paperEdits: project.metadata?.paperEdits ?? [],
+                        dailyID: currentDailyID,
+                        onToggleHighlight: toggleHighlight,
+                        onRemoveHighlight: removeHighlight,
+                        onAddToPaperEdit: addToPaperEdit
+                    )
+                }
             }
             AIChatPanel(segments: segments)
                 .frame(width: 340)
@@ -67,6 +92,10 @@ struct ContentView: View {
             // instead of inside AIChatPanel's header, which was fighting the role/provider
             // pickers for the panel's fixed 340pt width (see the "AI Chat" header overflow fix).
             ToolbarItemGroup(placement: .primaryAction) {
+                Button { openWindow(id: "paperEdit") } label: {
+                    Image(systemName: "film.stack")
+                }
+                .help("Paper Edit")
                 Button { openWindow(id: "about") } label: {
                     Image(systemName: "info.circle")
                 }
@@ -85,7 +114,7 @@ struct ContentView: View {
 
     private func handleDrop(providers: [NSItemProvider]) -> Bool {
         guard let provider = providers.first else { return false }
-        provider.loadFileRepresentation(forTypeIdentifier: UTType.audio.identifier) { url, _ in
+        provider.loadFileRepresentation(forTypeIdentifier: UTType.audiovisualContent.identifier) { url, _ in
             guard let url else { return }
             // The URL is only valid for the duration of this callback — copy it out
             // before handing off to the (async, longer-lived) transcription task. The copy lives
@@ -105,10 +134,10 @@ struct ContentView: View {
     /// `handleDrop` there's no need to copy it to a temp location first.
     private func browseForFile() {
         let panel = NSOpenPanel()
-        panel.title = "Choose Audio File"
+        panel.title = "Choose Audio or Video File"
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
-        panel.allowedContentTypes = [.audio]
+        panel.allowedContentTypes = [.audiovisualContent]
         guard panel.runModal() == .OK, let url = panel.url else { return }
         Task { await ingest(url) }
     }
@@ -129,7 +158,7 @@ struct ContentView: View {
             await ingest(localURL)
         } catch {
             youtubeError = error.localizedDescription
-            status = "Drop an audio file to begin"
+            status = "Drop an audio or video file to begin"
             isTranscribing = false
             transcriptionStartedAt = nil
         }
@@ -150,7 +179,7 @@ struct ContentView: View {
             return
         }
         do {
-            let (daily, mediaURL) = try project.addDaily(from: url, to: folderID)
+            let (daily, mediaURL) = try await project.addDaily(from: url, to: folderID)
             currentDailyID = daily.id
             await runTranscription(on: mediaURL, dailyID: daily.id)
         } catch {
@@ -179,6 +208,48 @@ struct ContentView: View {
         await runTranscription(on: sourceAudioURL, dailyID: currentDailyID)
     }
 
+    /// Highlights for whatever Daily is currently loaded (spec §8, highlight marking) — derived
+    /// straight from `project.metadata` rather than mirrored into separate `@State`, so it stays
+    /// automatically in sync with every `addHighlight`/`removeHighlight` call with no manual
+    /// re-fetch. Empty for a standalone (no-project) file — highlights are Daily data, and a
+    /// standalone file has no Daily to attach them to (same constraint Re-transcribe's
+    /// `dailyID` already follows).
+    private var currentHighlights: [Highlight] {
+        guard let currentDailyID, let metadata = project.metadata else { return [] }
+        for folder in metadata.folders {
+            if let daily = folder.dailies.first(where: { $0.id == currentDailyID }) { return daily.highlights }
+        }
+        return []
+    }
+
+    /// Marks/unmarks a single segment as a Highlight (spec §8: per-segment marking, the simpler
+    /// of the two selection mechanisms considered — cross-segment ranges are a later follow-up).
+    /// Toggled by matching `start` against any existing highlight for this segment; segments can
+    /// share duplicate text but not duplicate start times within one transcript, so `start` alone
+    /// is a safe identity check here (same reasoning as `Highlight`'s own doc comment).
+    private func toggleHighlight(for segment: TranscriptSegment) {
+        guard let currentDailyID else { return }
+        if let existing = currentHighlights.first(where: { $0.start == segment.start }) {
+            project.removeHighlight(existing.id, from: currentDailyID)
+        } else {
+            project.addHighlight(Highlight(id: UUID(), start: segment.start, end: segment.end, note: nil, createdAt: Date()), to: currentDailyID)
+        }
+    }
+
+    private func removeHighlight(_ highlightID: UUID) {
+        guard let currentDailyID else { return }
+        project.removeHighlight(highlightID, from: currentDailyID)
+    }
+
+    /// Adds a Highlight to a Paper Edit (spec §8) — `paperEditID` nil means "no existing Paper
+    /// Edit was chosen from the menu, create one first" (default-named, same "just works" spirit
+    /// as `+ New Folder`, renamable later if that's ever added).
+    private func addToPaperEdit(_ highlight: Highlight, paperEditID: UUID?) {
+        guard let currentDailyID else { return }
+        let targetID = paperEditID ?? project.addPaperEdit(name: "Paper Edit \((project.metadata?.paperEdits.count ?? 0) + 1)").id
+        project.addPaperEditEntry(highlightID: highlight.id, dailyID: currentDailyID, to: targetID)
+    }
+
     /// Clears the loaded-file state after the currently-displayed Daily is deleted out from under
     /// it, so the panels don't keep showing a transcript/waveform for media that no longer exists.
     /// Only reacts when the deleted Daily is the one actually loaded — deleting some other Daily
@@ -189,7 +260,7 @@ struct ContentView: View {
         segments = []
         sourceAudioURL = nil
         playback.reset()
-        status = "Drop an audio file to begin"
+        status = "Drop an audio or video file to begin"
         statusFraction = nil
     }
 
@@ -225,7 +296,12 @@ struct ContentView: View {
         }
 
         do {
-            let transcript = try await provider.transcribe(audio: url)
+            // Video dailies (spec §8) get their audio track extracted first — every provider
+            // reads its input as an audio file, and playback (above) already got the original
+            // video URL for preview, so this doesn't disturb what's on screen.
+            status = "Preparing audio…"
+            let transcribeURL = try await extractedAudioURL(from: url)
+            let transcript = try await provider.transcribe(audio: transcribeURL)
             segments = transcript.segments
             status = "\(segments.count) segments"
             if let dailyID { project.updateDailyTranscript(dailyID, segments: transcript.segments) }
@@ -498,7 +574,7 @@ private struct WaveformPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            PanelTitle("Waveform")
+            PanelTitle(playback.isVideo ? "Preview" : "Waveform")
             if playback.isLoaded {
                 loadedContent
             } else {
@@ -549,8 +625,14 @@ private struct WaveformPanel: View {
 
     private var loadedContent: some View {
         VStack(spacing: 8) {
-            WaveformBarsView(playback: playback)
-                .frame(maxHeight: .infinity)
+            if playback.isVideo {
+                PlayerView(player: playback.avPlayer)
+                    .frame(maxHeight: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            } else {
+                WaveformBarsView(playback: playback)
+                    .frame(maxHeight: .infinity)
+            }
             HStack(spacing: 10) {
                 Button {
                     playback.togglePlayPause()
@@ -584,6 +666,69 @@ private struct WaveformPanel: View {
                 }
             }
         }
+    }
+}
+
+/// Draggable divider between the Waveform/Preview panel and the Transcript panel (spec fix: the
+/// video preview needed to be both bigger by default and user-resizable). A plain `DragGesture`
+/// against a stored baseline (captured once per drag, not accumulated per-frame) rather than
+/// SwiftUI's `.resizable()`/split-view APIs, which target windows/columns, not two stacked
+/// panels sharing a `VStack` — this is a handful of lines either way, so no real cost to keeping
+/// styling consistent with the rest of the app (accent-tinted capsule, cyan design language)
+/// instead of adopting a stock unstyled splitter.
+private struct PanelResizeHandle: View {
+    @Binding var height: Double
+    let minHeight: CGFloat
+    let maxHeight: CGFloat
+
+    @State private var dragStartHeight: Double?
+    @State private var isHovering = false
+
+    var body: some View {
+        Capsule()
+            .fill(Theme.accent.opacity(isHovering ? 0.6 : 0.3))
+            .frame(width: 48, height: 5)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 7)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        if dragStartHeight == nil { dragStartHeight = height }
+                        let proposed = (dragStartHeight ?? height) + value.translation.height
+                        height = Double(min(max(CGFloat(proposed), minHeight), maxHeight))
+                    }
+                    .onEnded { _ in dragStartHeight = nil }
+            )
+            .onHover { hovering in
+                isHovering = hovering
+                if hovering { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
+            }
+            .animation(.easeOut(duration: 0.1), value: isHovering)
+    }
+}
+
+/// AppKit's `AVPlayerView` wrapped for SwiftUI (spec §8, video playback), used in place of
+/// SwiftUI's own `VideoPlayer`. `VideoPlayer` crashed on first render with a SIGABRT deep in
+/// Swift's generic metadata instantiation for `_AVKit_SwiftUI` (spec §5, Known Issues) — two
+/// separate crash reports, each with a *different* concurrent culprit thread, ruling out a race
+/// in Audium's own code and pointing at the bridging layer itself on this OS build. `AVPlayerView`
+/// is the older, stable AppKit control and never goes through `_AVKit_SwiftUI` at all.
+/// `.controlsStyle = .inline` keeps AVKit's native floating play/pause/scrub-bar overlay (spec
+/// §8: scrubbing must carry over to video) — cheaper and more standard than reimplementing a
+/// custom drag-to-scrub gesture over raw video like `WaveformBarsView` does for audio bars.
+private struct PlayerView: NSViewRepresentable {
+    let player: AVPlayer?
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.controlsStyle = .inline
+        view.player = player
+        return view
+    }
+
+    func updateNSView(_ nsView: AVPlayerView, context: Context) {
+        if nsView.player !== player { nsView.player = player }
     }
 }
 
@@ -650,6 +795,15 @@ private struct TranscriptPanel: View {
     let startedAt: Date?
     let sourceURL: URL?
     @ObservedObject var playback: AudioPlaybackController
+    let highlights: [Highlight]
+    let paperEdits: [PaperEdit]
+    /// nil for a standalone (no-project) file — highlights need a Daily to attach to, same
+    /// constraint as Re-transcribe's `dailyID`. Gates both the header's highlight count/list and
+    /// each row's highlight-toggle star.
+    let dailyID: UUID?
+    let onToggleHighlight: (TranscriptSegment) -> Void
+    let onRemoveHighlight: (UUID) -> Void
+    let onAddToPaperEdit: (Highlight, UUID?) -> Void
 
     /// Last segment whose start falls at or before the playhead — the one currently playing
     /// (spec §2: "clickable transcript sync"). A linear scan over a few hundred segments at most,
@@ -664,6 +818,16 @@ private struct TranscriptPanel: View {
             HStack {
                 PanelTitle("Transcript")
                 Spacer()
+                if dailyID != nil {
+                    HighlightsMenu(
+                        highlights: highlights,
+                        segments: segments,
+                        paperEdits: paperEdits,
+                        onSeek: { playback.seek(to: $0) },
+                        onRemove: onRemoveHighlight,
+                        onAddToPaperEdit: onAddToPaperEdit
+                    )
+                }
                 if !segments.isEmpty {
                     ExportMenu(segments: segments, sourceURL: sourceURL)
                 }
@@ -685,7 +849,10 @@ private struct TranscriptPanel: View {
                                 SegmentRow(
                                     segment: $segment,
                                     isCurrent: segment.id == currentID,
-                                    onSeek: { playback.seek(to: segment.start) }
+                                    isHighlighted: highlights.contains { $0.start == segment.start },
+                                    canHighlight: dailyID != nil,
+                                    onSeek: { playback.seek(to: segment.start) },
+                                    onToggleHighlight: { onToggleHighlight(segment) }
                                 )
                                 .id(segment.id)
                             }
@@ -763,7 +930,17 @@ private struct SegmentRow: View {
     @Binding var segment: TranscriptSegment
     /// True while this is the segment under the playhead (spec §2, clickable transcript sync).
     let isCurrent: Bool
+    /// True if a Highlight exists anchored to this segment (spec §8). Deliberately a *different*
+    /// visual treatment from `isCurrent` (a leading accent stripe, not another full-row tint) so
+    /// the two states read distinctly even when both are true at once — a highlighted segment
+    /// that also happens to be under the playhead shouldn't look like generic "extra-accented".
+    let isHighlighted: Bool
+    /// False for a standalone (no-project) file — there's no Daily to persist a highlight to, so
+    /// the star is shown but disabled/dimmed rather than hidden (keeps row layout stable when
+    /// opening/closing a project while a file is loaded).
+    let canHighlight: Bool
     let onSeek: () -> Void
+    let onToggleHighlight: () -> Void
 
     @State private var isEditingText = false
     @State private var isEditingSpeaker = false
@@ -780,14 +957,32 @@ private struct SegmentRow: View {
                     .font(.caption.bold())
                     .foregroundStyle(Theme.accent)
                 speakerField
+                Spacer()
+                Button { onToggleHighlight() } label: {
+                    Image(systemName: isHighlighted ? "star.fill" : "star")
+                        .font(.caption)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(isHighlighted ? Theme.accent : Theme.accent.opacity(0.4))
+                .disabled(!canHighlight)
+                .help(canHighlight ? (isHighlighted ? "Remove highlight" : "Mark as highlight") : "Open within a project to mark highlights")
             }
             textField
         }
         .padding(6)
+        .padding(.leading, isHighlighted ? 4 : 0)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(isCurrent ? Theme.accent.opacity(0.14) : .clear)
         )
+        .overlay(alignment: .leading) {
+            if isHighlighted {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Theme.accent)
+                    .frame(width: 3)
+                    .padding(.vertical, 2)
+            }
+        }
         .contentShape(Rectangle())
         .onTapGesture { onSeek() }
     }
@@ -876,6 +1071,113 @@ private struct SegmentRow: View {
                 .foregroundStyle(Theme.accent.opacity(0.7))
             }
         }
+    }
+}
+
+/// Highlights entry point for the current Daily (spec §8: "basic visibility" for highlights —
+/// not the full Paper Edit assembly view, that's the next phase). A `.popover` off a small
+/// count badge, same "click to reveal a lightweight list" shape as `ExportMenu` right next to it.
+private struct HighlightsMenu: View {
+    let highlights: [Highlight]
+    let segments: [TranscriptSegment]
+    let paperEdits: [PaperEdit]
+    let onSeek: (TimeInterval) -> Void
+    let onRemove: (UUID) -> Void
+    /// nil `PaperEdit.ID` means "create a new Paper Edit and add it there" (spec §8 UI: "Add to
+    /// Paper Edit" from the highlight list).
+    let onAddToPaperEdit: (Highlight, UUID?) -> Void
+
+    @State private var isShowingList = false
+
+    var body: some View {
+        Button {
+            isShowingList = true
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "star.fill")
+                Text("\(highlights.count)")
+            }
+            .font(.caption.bold())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(Theme.accent)
+        .popover(isPresented: $isShowingList, arrowEdge: .bottom) {
+            HighlightsListView(
+                highlights: highlights.sorted { $0.start < $1.start },
+                segments: segments,
+                paperEdits: paperEdits,
+                onSeek: { onSeek($0); isShowingList = false },
+                onRemove: onRemove,
+                onAddToPaperEdit: onAddToPaperEdit
+            )
+        }
+    }
+}
+
+private struct HighlightsListView: View {
+    let highlights: [Highlight]
+    let segments: [TranscriptSegment]
+    let paperEdits: [PaperEdit]
+    let onSeek: (TimeInterval) -> Void
+    let onRemove: (UUID) -> Void
+    let onAddToPaperEdit: (Highlight, UUID?) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Highlights").font(.headline)
+            if highlights.isEmpty {
+                Text("No highlights yet — click the star on a transcript segment to mark one.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: 260)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(highlights) { highlight in
+                            HStack(alignment: .top, spacing: 8) {
+                                Button(formatTime(highlight.start)) { onSeek(highlight.start) }
+                                    .buttonStyle(.plain)
+                                    .font(.caption.bold())
+                                    .foregroundStyle(Theme.accent)
+                                Text(segmentText(for: highlight))
+                                    .font(.caption)
+                                    .lineLimit(2)
+                                Spacer()
+                                Menu {
+                                    ForEach(paperEdits) { paperEdit in
+                                        Button(paperEdit.name) { onAddToPaperEdit(highlight, paperEdit.id) }
+                                    }
+                                    if !paperEdits.isEmpty { Divider() }
+                                    Button("New Paper Edit…") { onAddToPaperEdit(highlight, nil) }
+                                } label: {
+                                    Image(systemName: "film.stack")
+                                        .font(.caption)
+                                }
+                                .menuStyle(.borderlessButton)
+                                .fixedSize()
+                                .foregroundStyle(Theme.accent.opacity(0.7))
+                                .help("Add to Paper Edit")
+                                Button {
+                                    onRemove(highlight.id)
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .font(.caption)
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 240)
+            }
+        }
+        .padding()
+        .frame(width: 300)
+    }
+
+    private func segmentText(for highlight: Highlight) -> String {
+        segments.first { $0.start == highlight.start }?.text ?? "(segment not found)"
     }
 }
 
