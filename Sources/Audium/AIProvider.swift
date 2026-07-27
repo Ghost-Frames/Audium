@@ -21,25 +21,33 @@ protocol AIProvider {
 
 enum AIProviderError: LocalizedError {
     case missingAPIKey(KeychainStore.Provider)
-    case httpError(status: Int, body: String)
     case emptyResponse
 
     var errorDescription: String? {
         switch self {
         case .missingAPIKey(let provider):
             return "No API key saved for \(provider.rawValue). Add one in Settings."
-        case .httpError(let status, let body):
-            return "HTTP \(status): \(body)"
         case .emptyResponse:
             return "Empty completion response"
         }
     }
 }
 
-private func validateHTTP(_ response: URLResponse, data: Data) throws {
+/// Thrown by the shared `validateHTTP` below — used by both this file and
+/// `TranscriptionProvider.swift`, which hit the exact same non-2xx-response shape against
+/// different vendor APIs. Used to be two identical `.httpError` cases, one on each file's own
+/// error enum; neither call site ever switched on that specific case (both just surface
+/// `.localizedDescription`), so one shared error type replaces both.
+struct HTTPValidationError: LocalizedError {
+    let status: Int
+    let body: String
+    var errorDescription: String? { "HTTP \(status): \(body)" }
+}
+
+func validateHTTP(_ response: URLResponse, data: Data) throws {
     guard let http = response as? HTTPURLResponse else { return }
     guard (200...299).contains(http.statusCode) else {
-        throw AIProviderError.httpError(status: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
+        throw HTTPValidationError(status: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
     }
 }
 

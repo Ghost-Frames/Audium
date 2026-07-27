@@ -15,7 +15,9 @@ enum YouTubeDownloadError: LocalizedError {
     }
 }
 
-private final class OutputBuffer: @unchecked Sendable {
+/// Not `private` — reused by `WhisperCppProvider` for its own subprocess stderr capture (same
+/// readabilityHandler-drained pattern, shared instead of duplicated).
+final class OutputBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var text = ""
 
@@ -38,8 +40,10 @@ private final class OutputBuffer: @unchecked Sendable {
 enum YouTubeDownloader {
     /// Bundled at Contents/Resources/bin/<tool> in the shipped .app, same convention QCheck uses
     /// for ffmpeg/ffprobe (Resources/bin/<tool>, copied+signed by build.sh). Falls back to the
-    /// repo-relative copy so `swift run` works during dev without a full .app build.
-    private static func resourceBinPath(_ tool: String) -> String? {
+    /// repo-relative copy so `swift run` works during dev without a full .app build. Not
+    /// `private` — `WhisperCppProvider` reuses this same lookup for its own bundled binaries
+    /// (`ffmpeg`, `whisper-cli`) rather than duplicating it.
+    static func resourceBinPath(_ tool: String) -> String? {
         if let bundled = Bundle.main.resourceURL?.appendingPathComponent("bin/\(tool)").path,
            FileManager.default.fileExists(atPath: bundled) {
             return bundled

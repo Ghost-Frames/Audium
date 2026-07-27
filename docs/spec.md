@@ -945,22 +945,196 @@ things to check on their end are: reel names appearing correctly, clip names sur
 comments/notes, event timing landing on the right frames, and audio-only events importing as
 expected (vs. Avid expecting a video track present).
 
-### Export additions
+### ScriptFixer / ScriptSync export — implemented (2026-07-27)
 
-- **`.docx` export** — fourth format alongside TXT/SRT/VTT, using the same `Exporter` pattern.
-  Two distinct docx outputs likely needed: (1) a formatted transcript export (readable script
-  format, speaker labels, timestamps), and (2) a **paper edit export** — the assembled
-  highlights in script/screenplay-adjacent formatting, this being the actual deliverable this
-  whole feature exists to produce. `python-docx`-equivalent for Swift: check what's available
-  (likely hand-rolling OOXML via a Swift docx-writing approach, or a small library) — research
-  needed before implementation, don't assume a library exists without checking.
+Fourth `ExportFormat` case (`scriptSync`, alongside `txt`/`srt`/`vtt`) in the existing
+`Exporter.swift` — exports a single Daily's `Transcript` (not a Paper Edit; see scope note below)
+as Avid ScriptSync/PhraseFind-ready plain text. Button lives in the same `ExportMenu` row as
+TXT/SRT/VTT for free, since that row is already driven by `ExportFormat.allCases` — no separate UI
+wiring needed. `fileExtension`/`displayName` are overridden per-case (`.txt` on disk, "ScriptSync"
+label) since it's still a plain-text file, not a distinct container format.
+
+**Research performed before writing any code, per the same standing practice as the EDL exporter**:
+cloned the real `github.com/Ghost-Frames/ScriptFixer` (public repo, confirmed via
+`api.github.com/repos/Ghost-Frames/ScriptFixer`) and read its actual source — `ScriptFormatter.swift`,
+`ScriptExporter.swift`, `Models.swift`, `InterviewParser.swift` — rather than trusting the
+convention this spec's own §9 roadmap bullet had remembered secondhand. **That remembered
+convention was wrong on every specific it named**, confirmed against the real, currently-committed
+code (single commit, "Initial commit: ScriptFixer — Avid ScriptSync/PhraseFind format converter"):
+
+- **Dialogue indent**: remembered as "18-char". Real `ExportSettings` default for interview-transcript
+  mode (the relevant mode — see scope note) is **0** (flush-left), explicitly commented in
+  `Models.swift` as `"flush-left, per locked interview-mode reference format"`. 18-char indent turns
+  out to belong to Film Script mode's *detected* (not fixed-default) indent, a different mode
+  entirely that doesn't apply to a transcript export.
+- **Line width**: remembered as "52-char". Real default is **45**, commented as `"matches
+  reference file's continuous-paragraph wrap width"`.
+- **Cue format**: remembered as `"NAME:"`/`"NAME OS:"`. The real `InterviewParser.combine` emits a
+  bare `ScriptRow(kind: .cue, text: normalizedSpeaker.uppercased())` — **no colon, no "OS" suffix,
+  own line**. ScriptFixer's own `README.md` *describes* a planned `SPEAKER (O.S.)` off-camera tag
+  convention, but grepping the actual `InterviewParser.swift` source (`offCamera`, `O.S.`) shows
+  it's aspirational documentation for a feature that isn't implemented in the code — so it isn't
+  replicated here either. (`ScriptExporter.swift` does strip a literal `"(O.S.)"` substring *if
+  present in row text* when computing the internal `currentSpeaker` tracking variable used for the
+  per-speaker line-count report, but nothing in the parser ever writes that substring into a cue in
+  the first place — dead code for a shelved feature, not a format convention to match.)
+- **Confirmed correct as remembered**: ASCII sanitization (curly quotes → straight, en dash → `-`,
+  em dash → `--`, ellipsis → `...`, non-breaking space → plain space, anything else left for
+  lossy-ASCII's `?` substitution at write time) and CR/LF line endings — both replicated verbatim
+  from `ScriptFormatter.swift`'s `asciiMap` and `ScriptExporter.write`'s `joined(separator: "\r\n")`
+  + `.ascii`/`allowLossyConversion: true` encoding.
+
+**Scope decision**: exports from a single Daily's `Transcript`, not a Paper Edit — ScriptSync syncs
+a *full* transcript to picture (the PDF/README both frame it that way: "sync the whole interview"),
+not a curated selects reel, so a Paper Edit's assembled-highlights model would be the wrong input
+shape. Matches the task's own scoping instinct; nothing in the ScriptFixer source suggested
+otherwise.
+
+**Turn-grouping (the one real design decision not dictated by ScriptFixer's source)**:
+`Audium.TranscriptSegment` is a several-second ASR chunk, much finer-grained than one of
+ScriptFixer's `Turn`s (one whole paragraph from a source doc). Exporting one cue+blank per raw ASR
+segment would spam the file with cue lines mid-sentence. `Exporter.scriptSyncTurns` merges
+consecutive segments sharing the same `speaker` (including consecutive `nil`s, e.g. the common
+no-diarization case on Zeus's Intel machine — see [[whisper.cpp]] note) into one turn before
+formatting, so speaker changes — not ASR chunk boundaries — govern where cue lines and blank-line
+breaks land. When a transcript has no speaker labels at all (nil throughout), no cue lines are
+emitted anywhere — just continuous flush-left wrapped dialogue, verified separately (see below).
+
+**Verification — two passes, per the "compare against real ScriptFixer output" instruction**:
+1. **Byte-for-byte parity harness**: copied `ScriptFormatter.swift`/`ScriptExporter.swift`/
+   `Models.swift` verbatim from the cloned repo into a standalone command-line harness, built a
+   `ParsedScript` by hand using the exact row-construction logic
+   `InterviewParser.combine` uses (scene-heading divider + per-turn cue/dialogue/blank), and ran
+   the real `ScriptExporter.format`/`write`. Separately, copied Audium's new `renderScriptSync` +
+   helpers verbatim into a second standalone harness and ran it against the same two-turn input
+   (mixed curly quotes/en-dash/em-dash/ellipsis/nbsp, one line intentionally long enough to force a
+   wrap). `diff` on the two output files: **identical, byte-for-byte** (confirmed via `xxd`/hex
+   comparison too, not just `diff`'s text mode). Separately exercised the nil-speaker (no
+   diarization) path, which has no ScriptFixer equivalent to diff against — confirmed it correctly
+   suppresses cue lines and merges the two nil-speaker segments into one continuous wrapped block.
+2. **Real GUI test** (signed `build/Audium.app`, reusing the existing test project's `interview_clip`
+   Daily rather than fabricating new test data): opened "Audium Smoke Test Project" from Recent,
+   selected `interview_clip` (one segment, `speaker: "Speaker 0"`, from prior diarization testing),
+   clicked the ScriptSync button in the Transcript panel's export row — `NSSavePanel` opened
+   pre-filled with `<mediaFilename-without-extension>.txt` (the same UUID-based base name every
+   other export format already uses — `Daily.mediaFilename` is deliberately `<dailyID>.<ext>` on
+   disk per `ProjectController.addDaily`, unrelated to this task, not a bug introduced here). The
+   save completed to `.../TestClips/3362FF33-ABF8-475C-A0AE-B9E68601E38F.txt`; contents confirmed
+   correct on disk: heading divider/name/divider/blank, `SPEAKER 0` bare cue line, dialogue
+   hard-wrapped flush-left at ≤45 chars/line, real `\r\n` line endings, valid ASCII. `log show`
+   verification against `AudiumLog`'s own subsystem again returned zero lines for this run (same
+   unresolved gap noted for the whisper.cpp session — see CLAUDE.md) — cross-checked via the
+   on-disk file directly instead, consistent with that existing note.
+
+**Confidence level**: format conventions are **verified against ScriptFixer's real, current source
+and byte-identical in a synthetic harness** — the strongest verification tier used on this project
+so far for a ScriptFixer-adjacent feature, since ScriptFixer's actual formatting code could be run
+directly rather than only cross-referenced against docs. Not yet confirmed inside a real Avid
+ScriptSync/PhraseFind import (would need Avid + a real script bin on this machine to go further);
+same category of gap as the EDL exporter's not-yet-Avid-tested status.
+
+### `.docx` export — implemented (2026-07-27)
+
+The last unimplemented item from this spec's original v2 export requirements. Two outputs, per the
+original scoping: (1) a formatted transcript export (`ExportFormat.docx`, `Exporter.swift` — a
+fifth format alongside TXT/SRT/VTT/ScriptSync), and (2) a Paper Edit export (`PaperEditView`'s new
+"Export Docx…" button, next to "Export EDL…") — the actual "bring this into a meeting/share with
+the director" deliverable the Paper Edit feature exists to produce.
+
+**Research: no maintained Swift docx/OOXML library exists.** Checked live (not assumed) —
+`SwiftDocX` (Swift Package Index) and `ooxml-swift`/`che-word-mcp`, the only two real candidates
+found, are both brand-new 2026 repos: `Techopolis/SwiftDocX` has 25 stars and exactly one commit
+(`pushed_at` == `created_at`, 2026-01-15 — `updated_at` moving since then is just GitHub tracking
+stars/views, not code changes), `PsychQuant/ooxml-swift` has 0 stars and self-describes via
+marketing-flavored changelog language ("a 5-round 6-AI verify cycle") that reads more like
+generated filler than a real maintenance record. Neither has any track record trustworthy enough
+to bet "must open cleanly in Word" correctness on, and this project's own `CLAUDE.md` philosophy
+(zero-dependency where avoidable, WhisperKit being the one deliberate exception) argues against
+adding a third-party SPM dependency for something a `.docx` doesn't actually require one for: a
+docx is just a ZIP of a handful of small, format-stable XML files (OOXML's WordprocessingML has
+been stable for two decades), well within hand-rolling range for the plain-paragraphs-with-runs
+formatting this needs — same reasoning already applied to the CMX3600 EDL exporter.
+
+**Container structure verified against two independent real sources** (not assumed): insidewml.com's
+"What's in an Empty Word Document?" (confirmed the minimal 3-file structure — `[Content_Types].xml`,
+`_rels/.rels`, a document part — opens in both Word and LibreOffice Writer) and eduard93/docx's
+format writeup (confirmed the conventional `word/document.xml` path real-world files and other
+readers expect, vs. the first source's simpler root-level `document.xml`). No `word/styles.xml` is
+needed since `DocxExporter.Run` sets font/size/bold/italic/color directly on every run rather than
+relying on an inherited "Normal" style — one fewer part to get wrong.
+
+**The ZIP container itself is built by shelling out to `/usr/bin/zip`** (stock on every Mac, not a
+bundled binary) rather than hand-rolling ZIP's binary format — the same reasoning as bundling
+`ffmpeg`/`yt-dlp`/`whisper-cli`: reuse a real, correct implementation of the hard binary-format part
+instead of risking a "looks right as raw bytes but corrupt" writer, which is exactly the failure
+mode this task called out as a real regression risk. `-X` strips macOS extended attributes so no
+AppleDouble junk ends up inside the archive.
+
+**A real bug was found and fixed during testing — not just a stylistic font choice.** The first
+working version used `Calibri` (Word's modern default font) for every run. A standalone
+command-line harness (same precedent as the EDL exporter: compile+run the exporter's file(s)
+standalone with hand-verifiable input, outside the app) produced a structurally valid docx —
+`unzip -t` clean, `file` correctly identified it as "Microsoft Word 2007+" — but `textutil -convert
+rtf` (macOS's own Cocoa-based docx reader, the same engine behind TextEdit) showed every `<w:b/>`
+bold run silently rendering as regular weight, even though the underlying OOXML was byte-verified
+correct (`<w:b/>` genuinely present, correctly placed). **Root cause**: this machine's
+`~/Library/Fonts` has only `Calibri.ttf` (Regular) and `Calibri Bold Italic.ttf` — no plain "Calibri
+Bold" or "Calibri Italic" face exists as its own font file, and the renderer silently drops a style
+trait it has no matching font file for rather than synthesizing/faux-bolding it. Confirmed via a
+second harness run substituting `Times New Roman` (bold rendered correctly — real distinct Bold
+font file present) and finally `Helvetica` (also correct — `Helvetica`/`Helvetica-Bold`/
+`Helvetica-Oblique` all resolve to real font files, confirmed via `ls /System/Library/Fonts` showing
+`Helvetica.ttc`, a core Apple system font collection guaranteed present on every Mac). Since Calibri
+is a Microsoft font with no guarantee of being installed at all — let alone completely — on any
+given user's Mac, `Helvetica` was the fix, not a one-off workaround for this dev machine: it
+eliminates the whole class of "correct XML, wrong on screen" failure for every future user, not
+just this one. This is exactly the kind of thing a synthetic pre-GUI harness is for — same value
+the EDL exporter's harness already demonstrated on this project.
+
+**Format decisions**:
+- **Transcript docx** (`Exporter.renderTranscriptDocxParagraphs`): a bold title paragraph (the
+  source file's base name, 16pt), then one paragraph per segment — a small/gray/italic `[MM:SS]`
+  timestamp prefix, the speaker name in bold (only if a speaker label exists — no diarization on
+  Zeus's Intel machine means most segments have none, and no cue is emitted for those, same
+  no-speaker handling as the ScriptSync exporter), then the segment text in normal weight.
+  Paragraph-after spacing (10pt) between segments for readability.
+- **Paper Edit docx** (`PaperEditEntriesView.exportDocx`): a bold title paragraph (the Paper Edit's
+  name), then per entry in sequence order — one heading paragraph (Daily display name in bold, the
+  highlight's `MM:SS–MM:SS` range as a small/gray/italic suffix, matching `PaperEditEntryRow`'s own
+  on-screen `formatTime` convention for consistency between the UI and the exported document) and
+  one body paragraph with the highlighted text itself, wider spacing after each entry to visually
+  separate them. Reuses the same `DocxExporter` writer as the transcript export rather than a
+  second implementation.
+
+**Real GUI test** (signed `build/Audium.app`, existing "Audium Smoke Test Project" test data — the
+`interview_clip` Daily and the existing "Paper Edit 1" from the EDL testing pass, not fabricated new
+data): exported both via their real toolbar buttons (`NSSavePanel` confirmed by a human step per the
+permanent note above — this pass's confirm happened to succeed via the same AX `click` path used
+elsewhere in this session, but per the permanent note that isn't guaranteed reliable and a human
+should be ready to do it). Both files verified **four ways**, from weakest to strongest signal:
+1. `unzip -t` — zip integrity clean, both files.
+2. `file <path>` — correctly identified both as "Microsoft Word 2007+".
+3. `textutil -convert rtf/html` — macOS's own docx parser extracted correct text and correct
+   run-level formatting (fonts/sizes/bold/italic/color all resolved as intended) for both.
+4. **Opened in real Microsoft Word and real Apple Pages** (both installed on this machine) and
+   visually confirmed: the transcript docx renders its bold title, gray/italic timestamp prefix,
+   and bold speaker labels correctly in **both** apps (Word's Home tab even shows "Helvetica 16"
+   in its font controls with the title selected, confirming the font/size round-tripped exactly);
+   the Paper Edit docx renders as a clean, readable assembled document — bold Daily names, gray
+   timestamp ranges, plain highlighted text, correctly in sequence order, including the pre-existing
+   "(segment not found)" edge case from that Paper Edit's third entry (a stale highlight from
+   earlier EDL testing, unrelated to this feature) passing through gracefully rather than crashing.
+   This is the strongest verification tier available short of a real user opening it themselves —
+   both the doc-testing tool AND two independent real consumer applications confirm correctness.
 
 ### AI Chat "Roles" (text-based skills as system prompts)
 
 - User decision: **text-based skills only for v2** (not code-driven skills — see below).
 - **Skill sources, now fully imported (2026-07-23) — superseding the earlier ~14-file curated
   subset:**
-  - `ur-grue/autopunk-media-skills` — **all 394 `SKILL.md` files bundled**, not a curated
+  - `ur-grue/autopunk-media-skills` — **all `SKILL.md` files bundled** (394 at the 2026-07-23
+    import, **402 as of the 2026-07-27 audit** — see "Roles scope narrowed to strictly
+    media-related" below for the 8 files added and why nothing was removed), not a curated
     subset. Mirrored under `Skills/autopunk/<category>/<subcategory>/<skill-slug>.md`, matching
     the source repo's own `skills/<category>/<subcategory>/<skill-slug>/SKILL.md` layout
     (flattened by one level — only `SKILL.md`'s content is kept per skill, renamed to
@@ -977,12 +1151,13 @@ expected (vs. Avid expecting a video track present).
     awesome-claude-skills` curated list — unchanged, revisit only if a specific
     editorial-relevant code-driven skill is worth the much bigger investment of giving the app
     its own tool-execution capability.
-- **Bundle size impact**: `Skills/` is 4.1MB (394 autopunk files + filmcraft.md + the license
-  doc) — negligible against the ~123MB signed `.app` (WhisperKit/CoreML dominates that number).
+- **Bundle size impact**: `Skills/` is 4.5MB as of the 2026-07-27 audit (402 autopunk files +
+  filmcraft.md + the license doc; 4.1MB/394 files at the original 2026-07-23 import) —
+  negligible against the ~123MB signed `.app` (WhisperKit/CoreML dominates that number).
   `build.sh`'s existing `cp -R "$SKILLS_SRC" "$RES_DIR/Skills"` step needed no changes; it
   already copies the directory recursively regardless of how many category/subcategory levels
   are nested inside, confirmed via a real signed build (`codesign --verify --deep --strict`
-  clean) with all 396 `.md` files present under `Contents/Resources/Skills`.
+  clean) with all 404 `.md` files present under `Contents/Resources/Skills`.
 - **Display names**: `Role.name` (`Sources/Audium/Role.swift`) is *not* pulled directly from
   frontmatter — both source repos' `name:` field is the same kebab-case slug as the filename
   (e.g. `name: coverage-report-writer`), not a separate human title, so there's no cleaner field
@@ -1043,6 +1218,81 @@ expected (vs. Avid expecting a video track present).
     `set value`/`click` AX calls work fine against a background (non-frontmost) window, but any
     action requiring true OS-level keyboard input does not — see the Secure Input Mode note
     below for why keystroke simulation is avoided here entirely now, not just for API keys.
+
+### Roles scope narrowed to strictly media-related — audited (2026-07-27)
+
+New user direction: roles must be strictly media-related (filmmaking, podcast, journalism), not
+just "whatever the two source repos happened to contain." Since the 2026-07-23 import deliberately
+took *all* 394 autopunk files with no per-skill curation (see above), this needed a real audit
+rather than assuming the wholesale import was already correctly scoped.
+
+**Audit method** (all 394 autopunk files + filmcraft.md, every category):
+1. Per-category file listing + counts for all 21 categories, cross-referenced against category
+   names for anything obviously outside filmmaking/podcast/journalism/media production
+   (e.g. generic business, coding, lifestyle content) — none found; every category name itself
+   (`archive-legal`, `media-business`, `pr-communications`, `newsletter`, `social-media`,
+   `translation`, `image-prompting`, etc.) is already media-industry-specific, not generic.
+2. **Keyword sweep across all 394 files** for a broad media/journalism/filmmaking term set
+   (`media`, `journalis*`, `podcast`, `documentary`, `filmmak*`, `broadcast`, `newsroom`,
+   `publicat*`, `editorial`, `newsletter`, `reporter`, `footage`, `screenplay`, `shoot`, `camera`,
+   `tv`, `radio`, `press`, `episode`, `filming`, `scriptwrit*`, `youtube`) — **zero files matched
+   none of these**, i.e. every file references its media context explicitly somewhere in its own
+   content, not just its folder location.
+3. **Manual full-text read of the ~15 most plausibly-generic-sounding individual skills** across
+   the categories most likely to have drifted toward generic business/marketing content
+   (`social-media`, `pr-communications`, `newsletter`, `image-prompting`, `media-business`,
+   `archive-legal`) — specifically ones whose *filename* reads as generic business boilerplate
+   (`internal-memo-writer`, `faq-document-writer`, `welcome-email-writer`, `push-notification-writer`,
+   `seo-meta-description-writer`, `investor-brief-writer`, `gdpr-note-writer`, etc.). Every one of
+   these, read in full, explicitly scopes itself in its own "When To Use This Skill" text to a
+   media/journalism/press context (e.g. `faq-document-writer` → "journalist-facing FAQ document
+   ... spokespeople and press officers"; `welcome-email-writer` → "the newsletter's voice ...
+   editorial promise"; `gdpr-note-writer` → "a specific piece of journalistic content"; `push-
+   notification-writer` → "feature story, newsletter edition, or podcast episode"). None were
+   generic templates that merely happened to be filed under a media-sounding folder.
+4. **Finding: no removals warranted.** The 2026-07-23 wholesale import already was media-scoped
+   throughout — `ur-grue/autopunk-media-skills` is a purpose-built media-industry skill package,
+   not a generic content-marketing library that needed pruning back down to a media subset. Stating
+   this plainly rather than removing something just to have a removal to report: the honest result
+   of this audit is "already compliant," confirmed by evidence (keyword sweep + manual reads
+   above), not assumed.
+5. **Upstream diff, to check for real additions per the user's specific podcast/journalism ask**:
+   re-cloned `ur-grue/autopunk-media-skills` fresh and diffed against the bundled set — upstream
+   has grown from 394 to 402 `SKILL.md` files since the 2026-07-23 import (`locales` category is
+   still empty upstream, unchanged). The 8 new files: 3 in `editing` (`project-memory`,
+   `project-retrospective`, `template-selector` — editorial workflow/meta-navigation skills, all
+   tagged `editorial-*` and explicitly framed for "media professionals" navigating this exact
+   skill library) and **5 in `magazine-journalism`** (`editing/ethics-review-checklist`,
+   `editing/newsroom-ai-policy`, `ideation/beat-setup-guide`, `ideation/editorial-calendar-planner`,
+   `writing/breaking-news-brief`) — all five explicitly journalism-specific (beat reporting,
+   newsroom AI policy, editorial ethics review, breaking-news workflow), directly answering the
+   user's specific call-out of journalism as a named domain. All 8 added, mirrored into
+   `Skills/autopunk/<category>/<subcategory>/<slug>.md` the same way the original import did.
+   Podcast-specific skills: upstream's `podcast` category (12 files: pre-production/scripting/
+   post-production/business, a complete production pipeline) is unchanged since the original
+   import — no new podcast skills exist upstream to add. Didn't go hunting for a separate
+   third-party podcast-skills repo beyond this — the existing 12-file category is already a
+   complete pipeline, not a thin stub that would justify sourcing a second package for the same
+   niche.
+- **Before/after counts**: 394 → 402 autopunk files (+8, all `magazine-journalism`/`editing`
+  additions above), 0 removed. Total bundled `.md` count (autopunk + `filmcraft.md` +
+  `THIRD_PARTY_LICENSES.md`): 396 → 404. `RolePickerButton`'s role count: 395 → 403 (394+1 →
+  402+1, `filmcraft` counted as its own always-present role as before).
+- **No code changes needed** — `RoleLibrary.load()` (`Role.swift`) walks `Skills/` with a plain
+  `FileManager.enumerator`, and category/subcategory come from the new files' own `category:`
+  frontmatter and folder position respectively (same mechanism documented above) — adding files in
+  the existing folder layout was sufficient, the picker's grouping logic needed no changes.
+- **Real GUI verification** (signed `build/Audium.app`, rebuilt after adding the 8 files —
+  `codesign --verify --deep --strict` clean, 404 `.md` files confirmed present under
+  `Contents/Resources/Skills`): opened the role picker popover — placeholder correctly reads
+  "Search 403 roles…"; category sections render correctly and alphabetically (`Archive Legal`,
+  `Audience Distribution`, …); searching "newsroom" correctly surfaces both new journalism
+  additions (`Breaking News Brief` under Writing, `Newsroom AI Policy` under Editing), grouped
+  under the `Magazine Journalism` section header — confirming the new files are indexed, parsed,
+  and searchable by name/summary text exactly like the original 394. Didn't re-verify the
+  click-to-select mechanic itself in this pass (unchanged code, already verified end-to-end in the
+  2026-07-24 pass above); this pass's new-information check was the count/grouping/search
+  behavior against the changed data set, which is what could plausibly have broken.
 
 ### AI Chat header overflow bug — fixed (2026-07-23)
 
@@ -1159,7 +1409,10 @@ Rough phase order, to be refined as each lands:
 1. AI Chat roles — **complete (2026-07-23)**: all 394 autopunk skills + filmcraft imported,
    grouped/searchable picker UI, human-readable display names. (Originally scoped as a curated
    ~14-file subset with a stock menu picker; expanded to the full set once the picker UI could
-   handle grouping/search at that scale — see the Roles subsection above.)
+   handle grouping/search at that scale — see the Roles subsection above.) **Scope audited
+   (2026-07-27)**: confirmed strictly media-related per new user direction, 394 → 402 (8 genuine
+   journalism/editorial additions pulled from upstream, 0 removed — see "Roles scope narrowed to
+   strictly media-related" subsection above for the full audit).
 2. Project data model + project browser UI (foundation everything else needs) — **complete
    (2026-07-26)**, real GUI smoke test passed end-to-end. See the dedicated subsection below
    ("Project data model + browser UI — smoke test complete") for full detail.
@@ -1181,7 +1434,18 @@ Rough phase order, to be refined as each lands:
    re-derivation; not yet confirmed against a real Avid import. See the dedicated subsection above
    ("EDL export (CMX3600) — implemented") for full detail, citations, and three bugs found and
    fixed during testing.
-7. `.docx` export (transcript + paper edit formats)
+7. ScriptFixer/ScriptSync export — **complete (2026-07-27)**, format conventions verified against
+   ScriptFixer's real source (not secondhand memory — the roadmap bullet below turned out wrong on
+   indent/width/cue-format specifics) and byte-identical to real ScriptFixer output in a standalone
+   harness, plus a real GUI smoke test against the existing `interview_clip` test Daily. See the
+   dedicated subsection above ("ScriptFixer / ScriptSync export — implemented") for full detail,
+   citations, and the three corrected assumptions.
+8. `.docx` export (transcript + paper edit formats) — **complete (2026-07-27)**, hand-rolled OOXML
+   (no maintained Swift docx library exists — checked live) with a real bug found and fixed during
+   testing (a font-availability issue silently dropping bold; fixed by switching to a guaranteed-
+   present system font) — verified in real Microsoft Word and real Apple Pages, not just structural
+   checks. See the dedicated subsection above ("`.docx` export — implemented") for full detail.
+   This was the last unimplemented item from Section 2's original v2 export requirements.
 
 ## 9. v2 Roadmap — Additional Items (not yet sequenced against Section 8 above)
 
@@ -1192,10 +1456,14 @@ Rough phase order, to be refined as each lands:
 - **StoryToolkitAI-style features** — semantic/content search across transcripts, transcript
   groups, question detection. Deliberately deferred from v1 (see original scoping conversation)
   — revisit once core app is stable.
-- **ScriptFixer integration** — export option for Avid ScriptSync-ready plain text, reusing
-  ScriptFixer's existing parsing/formatting conventions (18-char dialogue indent, 52-char line
-  width, `NAME:`/`NAME OS:` cue format, ASCII sanitization) as a fourth export format alongside
-  TXT/SRT/VTT. Natural fit given both tools already live in the Ghost-Frames ecosystem.
+- **ScriptFixer integration** — **complete (2026-07-27)**, see §8's "ScriptFixer / ScriptSync
+  export" subsection. The conventions guessed here from memory (18-char dialogue indent, 52-char
+  line width, `NAME:`/`NAME OS:` cue format) turned out to be wrong in every particular once
+  checked against ScriptFixer's real source — actual interview-mode conventions are 0-char
+  (flush-left) indent, 45-char line width, and a bare uppercase speaker name with no colon/suffix
+  as the cue line. Left here for the record rather than silently rewritten, since it's a concrete
+  example of why this project's standing practice requires checking real sources for interchange
+  formats instead of trusting recollection.
 - Batch/folder auto-detect transcription (competitor-validated as a common expectation, not
   currently in v1 scope)
 

@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
 /// The assembled "selects" reel (spec §8) — a separate window rather than a 5th bento panel,
 /// since the existing 4-panel layout (project tree · waveform/preview · transcript · AI chat) is
@@ -172,6 +174,9 @@ private struct PaperEditEntriesView: View {
                     Button("Export EDL…") { exportEDL() }
                         .font(.caption.bold())
                         .buttonStyle(.accent)
+                    Button("Export Docx…") { exportDocx() }
+                        .font(.caption.bold())
+                        .buttonStyle(.accent)
                 }
             }
             .padding([.top, .horizontal])
@@ -237,6 +242,44 @@ private struct PaperEditEntriesView: View {
         }
         EDLExporter.presentSavePanel(paperEditName: paperEdit.name, entries: entries)
     }
+
+    /// The actual "bring this into a meeting/share with the director" deliverable (spec §8/§9) —
+    /// a readable assembled script: each entry's source Daily name + timestamp range as a bold/
+    /// subtle-gray heading line, then the highlighted text itself, in Paper Edit sequence order.
+    /// Reuses `DocxExporter` (the same OOXML/zip writer `Exporter.swift`'s transcript `.docx`
+    /// export uses) rather than a second implementation.
+    private func exportDocx() {
+        var paragraphs: [DocxExporter.Paragraph] = [
+            DocxExporter.Paragraph(
+                [DocxExporter.Run(text: paperEdit.name, bold: true, sizeHalfPoints: 32)],
+                spacingAfterTwips: 300
+            )
+        ]
+        for item in resolved {
+            paragraphs.append(DocxExporter.Paragraph([
+                DocxExporter.Run(text: item.daily.displayName, bold: true),
+                DocxExporter.Run(text: "  \(formatTime(item.start))–\(formatTime(item.end))", italic: true, color: "808080", sizeHalfPoints: 18)
+            ], spacingAfterTwips: 60))
+            paragraphs.append(DocxExporter.Paragraph(
+                [DocxExporter.Run(text: item.text)],
+                spacingAfterTwips: 300
+            ))
+        }
+
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = paperEdit.name.isEmpty ? "Paper Edit" : paperEdit.name
+        panel.allowedContentTypes = [UTType(filenameExtension: "docx") ?? .data]
+        guard panel.runModal() == .OK, let url = panel.url else {
+            AudiumLog.export.info("Paper Edit docx export canceled by user")
+            return
+        }
+        do {
+            try DocxExporter.write(paragraphs: paragraphs, to: url)
+            AudiumLog.export.info("Paper Edit docx export succeeded: \(url.path, privacy: .public)")
+        } catch {
+            AudiumLog.export.error("Paper Edit docx export failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
 }
 
 private struct PaperEditEntryRow: View {
@@ -283,9 +326,3 @@ private struct PaperEditEntryRow: View {
     }
 }
 
-private func formatTime(_ seconds: TimeInterval) -> String {
-    guard seconds.isFinite, seconds >= 0 else { return "00:00" }
-    let m = Int(seconds) / 60
-    let s = Int(seconds) % 60
-    return String(format: "%02d:%02d", m, s)
-}

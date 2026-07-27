@@ -249,20 +249,25 @@ final class ProjectController: ObservableObject {
         return Double(rate)
     }
 
-    func updateDailyTranscript(_ dailyID: UUID, segments: [TranscriptSegment]) {
+    /// Shared by every mutation that needs to find a Daily without already knowing its folder
+    /// (`updateDailyTranscript`/`addHighlight`/`removeHighlight` all used to repeat this same
+    /// two-step lookup inline).
+    private func locateDaily(_ dailyID: UUID) -> (folderIndex: Int, dailyIndex: Int)? {
         guard let folderIndex = metadata?.folders.firstIndex(where: { folder in
             folder.dailies.contains { $0.id == dailyID }
-        }) else { return }
-        guard let dailyIndex = metadata?.folders[folderIndex].dailies.firstIndex(where: { $0.id == dailyID }) else { return }
+        }) else { return nil }
+        guard let dailyIndex = metadata?.folders[folderIndex].dailies.firstIndex(where: { $0.id == dailyID }) else { return nil }
+        return (folderIndex, dailyIndex)
+    }
+
+    func updateDailyTranscript(_ dailyID: UUID, segments: [TranscriptSegment]) {
+        guard let (folderIndex, dailyIndex) = locateDaily(dailyID) else { return }
         metadata?.folders[folderIndex].dailies[dailyIndex].transcript.segments = segments
         try? save()
     }
 
     func addHighlight(_ highlight: Highlight, to dailyID: UUID) {
-        guard let folderIndex = metadata?.folders.firstIndex(where: { folder in
-            folder.dailies.contains { $0.id == dailyID }
-        }) else { return }
-        guard let dailyIndex = metadata?.folders[folderIndex].dailies.firstIndex(where: { $0.id == dailyID }) else { return }
+        guard let (folderIndex, dailyIndex) = locateDaily(dailyID) else { return }
         metadata?.folders[folderIndex].dailies[dailyIndex].highlights.append(highlight)
         try? save()
         AudiumLog.project.info("Highlight added to daily \(dailyID.uuidString, privacy: .public)")
@@ -274,10 +279,7 @@ final class ProjectController: ObservableObject {
     /// Highlight (see `removeEntry`) — this is the one direction that does cascade, since a
     /// Highlight is the thing an entry exists to reference.
     func removeHighlight(_ highlightID: UUID, from dailyID: UUID) {
-        guard let folderIndex = metadata?.folders.firstIndex(where: { folder in
-            folder.dailies.contains { $0.id == dailyID }
-        }) else { return }
-        guard let dailyIndex = metadata?.folders[folderIndex].dailies.firstIndex(where: { $0.id == dailyID }) else { return }
+        guard let (folderIndex, dailyIndex) = locateDaily(dailyID) else { return }
         metadata?.folders[folderIndex].dailies[dailyIndex].highlights.removeAll { $0.id == highlightID }
         removeDanglingPaperEditEntries { $0.highlightID == highlightID }
         try? save()

@@ -109,7 +109,6 @@ struct WhisperKitProvider: TranscriptionProvider {
 enum TranscriptionError: LocalizedError {
     case missingAPIKey(KeychainStore.Provider)
     case unsupportedAudioFormat(String)
-    case httpError(status: Int, body: String)
     case emptyResponse
     case unsupportedOnThisHardware
 
@@ -119,8 +118,6 @@ enum TranscriptionError: LocalizedError {
             return "No API key saved for \(provider.rawValue). Add one in Settings."
         case .unsupportedAudioFormat(let ext):
             return "Unsupported audio format: .\(ext)"
-        case .httpError(let status, let body):
-            return "HTTP \(status): \(body)"
         case .emptyResponse:
             return "Empty transcription response"
         case .unsupportedOnThisHardware:
@@ -129,12 +126,8 @@ enum TranscriptionError: LocalizedError {
     }
 }
 
-private func validateHTTP(_ response: URLResponse, data: Data) throws {
-    guard let http = response as? HTTPURLResponse else { return }
-    guard (200...299).contains(http.statusCode) else {
-        throw TranscriptionError.httpError(status: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
-    }
-}
+// `validateHTTP`/`HTTPValidationError` now live in AIProvider.swift, shared by both files —
+// same non-2xx-response shape against a different vendor API. See that file's doc comment.
 
 private func audioDurationSeconds(_ url: URL) async throws -> TimeInterval {
     let asset = AVURLAsset(url: url)

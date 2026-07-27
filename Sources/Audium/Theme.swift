@@ -1,5 +1,14 @@
 import SwiftUI
 
+/// MM:SS for playhead/timecode display — shared by `ContentView`'s Waveform/Transcript panels
+/// and `PaperEditView`'s entry rows (was two byte-identical private copies).
+func formatTime(_ seconds: TimeInterval) -> String {
+    guard seconds.isFinite, seconds >= 0 else { return "00:00" }
+    let m = Int(seconds) / 60
+    let s = Int(seconds) % 60
+    return String(format: "%02d:%02d", m, s)
+}
+
 enum Theme {
     /// OLED-black app background (spec §4).
     static let background = Color(red: 0, green: 0, blue: 0)

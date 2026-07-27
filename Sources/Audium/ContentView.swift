@@ -784,12 +784,6 @@ private struct WaveformBarsView: View {
     }
 }
 
-private func formatTime(_ seconds: TimeInterval) -> String {
-    guard seconds.isFinite, seconds >= 0 else { return "00:00" }
-    let m = Int(seconds) / 60
-    let s = Int(seconds) % 60
-    return String(format: "%02d:%02d", m, s)
-}
 
 private struct TranscriptPanel: View {
     @Binding var segments: [TranscriptSegment]

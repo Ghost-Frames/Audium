@@ -43,12 +43,15 @@ enum WhisperCppModel: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    /// "base.en" -> "Base (English)", "large-v3-turbo" -> "Large V3 Turbo"
+    /// "base.en" -> "Base (English)", "large-v3-turbo" -> "Large V3 Turbo". Capitalize first,
+    /// then append the "(English)" parenthetical — appending it before capitalizing lowercases
+    /// it (`\.capitalized` only preserves the first letter of each word), which needed a second
+    /// patch-up `.replacingOccurrences` pass to fix; this way there's nothing to patch.
     var displayName: String {
-        var name = rawValue.replacingOccurrences(of: ".en", with: " (English)")
-        name = name.replacingOccurrences(of: "-", with: " ")
-        return name.split(separator: " ").map(\.capitalized).joined(separator: " ")
-            .replacingOccurrences(of: "(english)", with: "(English)")
+        let isEnglishOnly = rawValue.hasSuffix(".en")
+        let base = rawValue.replacingOccurrences(of: ".en", with: "")
+            .split(separator: "-").map(\.capitalized).joined(separator: " ")
+        return isEnglishOnly ? "\(base) (English)" : base
     }
 
     var filename: String { "ggml-\(rawValue).bin" }
@@ -149,25 +152,8 @@ struct WhisperCppProvider: TranscriptionProvider {
         }
     }
 
-    /// Bundled at Contents/Resources/bin/<tool> in the shipped .app — same convention/fallback
-    /// `YouTubeDownloader.resourceBinPath` already uses for yt-dlp/ffmpeg (Resources/bin/<tool>,
-    /// copied+signed by build.sh), duplicated here rather than shared since it's a ~10-line
-    /// path lookup, not worth a cross-file dependency for.
-    private func resourceBinPath(_ tool: String) -> String? {
-        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("bin/\(tool)").path,
-           FileManager.default.fileExists(atPath: bundled) {
-            return bundled
-        }
-        let devFallback = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent() // Sources/Audium
-            .deletingLastPathComponent() // Sources
-            .deletingLastPathComponent() // repo root
-            .appendingPathComponent("Resources/bin/\(tool)").path
-        return FileManager.default.fileExists(atPath: devFallback) ? devFallback : nil
-    }
-
     private func convertToWAV(_ input: URL) async throws -> URL {
-        guard let ffmpeg = resourceBinPath("ffmpeg") else {
+        guard let ffmpeg = YouTubeDownloader.resourceBinPath("ffmpeg") else {
             throw WhisperCppError.toolNotFound("ffmpeg")
         }
         let workDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -194,7 +180,7 @@ struct WhisperCppProvider: TranscriptionProvider {
     /// citation). `-np` suppresses the human-readable transcript it'd otherwise print to stdout,
     /// keeping the process's own output limited to what we're not even reading.
     private func runWhisperCLI(audio: URL, model: URL) async throws -> [TranscriptSegment] {
-        guard let whisperCli = resourceBinPath("whisper-cli") else {
+        guard let whisperCli = YouTubeDownloader.resourceBinPath("whisper-cli") else {
             throw WhisperCppError.toolNotFound("whisper-cli")
         }
         let outputBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -234,17 +220,18 @@ struct WhisperCppProvider: TranscriptionProvider {
         }
     }
 
-    /// Owns stderr capture itself (a `readabilityHandler`-drained buffer, same pattern
-    /// `YouTubeDownloader` uses for its own subprocess output) rather than leaving the caller to
-    /// read the pipe only after the process exits — both `ffmpeg` and `whisper-cli` write enough
-    /// to stderr (confirmed directly: ffmpeg's banner/progress output alone is several KB) that
-    /// reading only post-exit risks the classic `Process`/`Pipe` deadlock, where the child blocks
-    /// on a full pipe buffer that nothing is draining yet. `stdout` is left unset by callers
-    /// (`FileHandle.nullDevice`) since neither tool's stdout is read.
+    /// Owns stderr capture itself (a `readabilityHandler`-drained `OutputBuffer`, same class
+    /// `YouTubeDownloader` uses for its own subprocess output — shared, not duplicated) rather
+    /// than leaving the caller to read the pipe only after the process exits — both `ffmpeg` and
+    /// `whisper-cli` write enough to stderr (confirmed directly: ffmpeg's banner/progress output
+    /// alone is several KB) that reading only post-exit risks the classic `Process`/`Pipe`
+    /// deadlock, where the child blocks on a full pipe buffer that nothing is draining yet.
+    /// `stdout` is left unset by callers (`FileHandle.nullDevice`) since neither tool's stdout is
+    /// read.
     private func runProcess(_ process: Process, onFailure: (Int32, String) throws -> Void) async throws {
         let stderrPipe = Pipe()
         process.standardError = stderrPipe
-        let stderrBuffer = ProcessOutputBuffer()
+        let stderrBuffer = OutputBuffer()
         stderrPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
@@ -264,24 +251,5 @@ struct WhisperCppProvider: TranscriptionProvider {
         if process.terminationStatus != 0 {
             try onFailure(process.terminationStatus, stderrBuffer.value.trimmingCharacters(in: .whitespacesAndNewlines))
         }
-    }
-}
-
-/// `readabilityHandler` fires on a GCD-managed queue, not the caller's — needs a lock, not a bare
-/// `var`, to accumulate safely (same reasoning/shape as `YouTubeDownloader`'s private copy).
-private final class ProcessOutputBuffer: @unchecked Sendable {
-    private let lock = NSLock()
-    private var text = ""
-
-    func append(_ s: String) {
-        lock.lock()
-        text += s
-        lock.unlock()
-    }
-
-    var value: String {
-        lock.lock()
-        defer { lock.unlock() }
-        return text
     }
 }
