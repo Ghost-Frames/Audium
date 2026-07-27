@@ -71,7 +71,26 @@ else
     echo "   ⚠️  ffmpeg not found in Resources/bin/"
 fi
 
-# ── 3c. Bundle Skills (AI Chat role presets, spec §8) ────────
+# ── 3c. Bundle whisper.cpp (local CPU-only transcription, spec §3/§5) ────
+# Built locally from source (ggml-org/whisper.cpp, static: -DBUILD_SHARED_LIBS=OFF,
+# CPU-only: no -DGGML_METAL=1/-DWHISPER_COREML=1) — no official standalone macOS CLI
+# binary is published upstream (confirmed via their GitHub Releases API: Linux/Windows/
+# CUDA archives and an Xcode-only xcframework, no macOS CLI), unlike ffmpeg/yt-dlp which
+# do ship prebuilt static binaries. x86_64-only (built on Zeus, an Intel Mac — the whole
+# point of this provider); runs on Apple Silicon via Rosetta 2, same tradeoff ffmpeg
+# already has below. `otool -L` confirms it only links system frameworks (libSystem,
+# Accelerate, libc++) — no bundled dylibs needed alongside it.
+echo "▶ Bundling whisper.cpp…"
+WHISPER_CLI_SRC="$SCRIPT_DIR/Resources/bin/whisper-cli"
+if [ -f "$WHISPER_CLI_SRC" ]; then
+    cp "$WHISPER_CLI_SRC" "$BIN_DIR/whisper-cli"
+    chmod +x "$BIN_DIR/whisper-cli"
+    echo "   ✅ whisper-cli bundled"
+else
+    echo "   ⚠️  whisper-cli not found in Resources/bin/"
+fi
+
+# ── 3d. Bundle Skills (AI Chat role presets, spec §8) ────────
 echo "▶ Bundling Skills…"
 SKILLS_SRC="$SCRIPT_DIR/Skills"
 if [ -d "$SKILLS_SRC" ]; then
@@ -214,6 +233,7 @@ else
 fi
 [ -f "$BIN_DIR/yt-dlp" ] && sign_item "$BIN_DIR/yt-dlp" && echo "   Signed: yt-dlp"
 [ -f "$BIN_DIR/ffmpeg" ] && sign_item "$BIN_DIR/ffmpeg" && echo "   Signed: ffmpeg"
+[ -f "$BIN_DIR/whisper-cli" ] && sign_item "$BIN_DIR/whisper-cli" && echo "   Signed: whisper-cli"
 sign_item "$MACOS_DIR/$APP_NAME"
 echo "   Signed: $APP_NAME binary"
 xattr -cr "$APP_DIR" 2>/dev/null || true

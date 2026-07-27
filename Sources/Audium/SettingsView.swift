@@ -16,17 +16,20 @@ struct SettingsView: View {
     @State private var whisperDefaultVariant = ""
     @State private var selectedWhisperVariant: String?
 
+    @State private var selectedWhisperCppModel = WhisperCppSettings.selectedVariant
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 apiKeysSection
                 transcriptionProviderSection
                 whisperModelSection
+                whisperCppModelSection
                 chatProviderSection
             }
             .padding()
         }
-        .frame(width: 460, height: 620)
+        .frame(width: 460, height: 720)
         .background(Theme.background)
         .onAppear {
             loadExistingKeys()
@@ -73,6 +76,7 @@ struct SettingsView: View {
             Picker("", selection: $defaultTranscriptionProvider) {
                 Text("WhisperKit (local)").tag(TranscriptionProviderKind.whisperKit)
                     .disabled(!HardwareCapability.hasNeuralEngine)
+                Text("whisper.cpp (local, CPU)").tag(TranscriptionProviderKind.whisperCpp)
                 Text("Gemini (cloud)").tag(TranscriptionProviderKind.gemini)
                 Text("OpenAI (cloud)").tag(TranscriptionProviderKind.openAI)
             }
@@ -85,7 +89,7 @@ struct SettingsView: View {
             // can even route around it — disabling the option above isn't enough on its own,
             // since it can't undo a WhisperKit default persisted before this check existed.
             if !HardwareCapability.hasNeuralEngine {
-                Text("WhisperKit is unsupported on this Mac — an upstream crash affects Intel Macs without a Neural Engine (see docs/spec.md Known Issues). Use Gemini or OpenAI instead.")
+                Text("WhisperKit is unsupported on this Mac — an upstream crash affects Intel Macs without a Neural Engine (see docs/spec.md Known Issues). whisper.cpp is the local option that actually works here (CPU-only, no Neural Engine needed) — Gemini/OpenAI remain available too.")
                     .font(.caption2)
                     .foregroundStyle(Theme.accent)
             }
@@ -94,8 +98,12 @@ struct SettingsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassPanel()
         .onAppear {
+            // Steers to whisper.cpp, not a cloud provider, when WhisperKit is blocked (spec §5) —
+            // it's the local/private-by-default option that actually works on this hardware,
+            // matching the app's local-first principle more closely than defaulting to a cloud
+            // API key requirement.
             if defaultTranscriptionProvider == .whisperKit && !HardwareCapability.hasNeuralEngine {
-                defaultTranscriptionProvider = .gemini
+                defaultTranscriptionProvider = .whisperCpp
             }
         }
     }
@@ -116,6 +124,28 @@ struct SettingsView: View {
             .labelsHidden()
             .onChange(of: selectedWhisperVariant) { _, newValue in
                 WhisperModelSettings.selectedVariant = newValue
+            }
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassPanel()
+    }
+
+    private var whisperCppModelSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            PanelTitle("whisper.cpp Model Size")
+            Text("Downloaded on first use, same as WhisperKit's models. Bigger models are slower without GPU/Neural Engine acceleration (this build is CPU-only by design — see docs/spec.md §3).")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Picker("", selection: $selectedWhisperCppModel) {
+                ForEach(WhisperCppModel.allCases) { model in
+                    Text(model.displayName).tag(model)
+                }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .onChange(of: selectedWhisperCppModel) { _, newValue in
+                WhisperCppSettings.selectedVariant = newValue
             }
         }
         .padding()

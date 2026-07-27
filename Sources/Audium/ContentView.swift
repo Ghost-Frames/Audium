@@ -285,6 +285,10 @@ struct ContentView: View {
             var whisperKit = WhisperKitProvider()
             whisperKit.onStatus = onStatus
             provider = whisperKit
+        case .whisperCpp:
+            var whisperCpp = WhisperCppProvider()
+            whisperCpp.onStatus = onStatus
+            provider = whisperCpp
         case .gemini:
             var gemini = GeminiTranscriptionProvider()
             gemini.onStatus = onStatus

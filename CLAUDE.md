@@ -1,7 +1,10 @@
 # Audium
 
-Native macOS transcription app (WhisperKit/Gemini/OpenAI transcription + multi-provider AI
-chat), built zero-dependency/no-Xcode like the other Ghost-Frames tools.
+Native macOS transcription app (WhisperKit/whisper.cpp/Gemini/OpenAI transcription +
+multi-provider AI chat), built zero-dependency/no-Xcode like the other Ghost-Frames tools.
+whisper.cpp (bundled static binary, `Resources/bin/whisper-cli`, CPU-only) is the local
+transcription option on Intel Macs — WhisperKit's CoreML pipeline is unsupported there (spec §5,
+Known Issues); Zeus specifically is Intel, so this matters for testing on this machine.
 
 v1 (transcription core) is feature-complete and pre-release-cleaned. v2 is underway: pivoting
 toward a project-based story-editing tool — screen dailies, transcribe, mark highlights, and
@@ -48,3 +51,20 @@ with hand-verifiable inputs, outside the app) caught a real math bug before it e
 GUI test. Where genuine confidence is only "structurally correct, not confirmed against the real
 target application," say so explicitly rather than implying more certainty than earned — this
 project ships to a real Avid workflow, and quiet overconfidence there is worse than an honest gap.
+
+**Standing practice (as of 2026-07-27): bundling a third-party CLI tool that has no official
+prebuilt macOS binary requires checking the actual GitHub Releases API (or equivalent), not the
+web page** — `whisper.cpp`'s releases page failed to render its own asset list over `WebFetch`,
+but `curl .../releases/latest` (GitHub's REST API) gave the real, complete asset manifest
+immediately, confirming no macOS CLI binary existed and building from source was actually
+necessary, not just assumed. When building from source for bundling, verify the result is
+actually self-contained (`otool -L`, expect only system frameworks — `libSystem`, `Accelerate`,
+`libc++`, etc.) before treating it as equivalent to `ffmpeg`/`yt-dlp`'s bundled static binaries.
+**Also noted this session**: `log show --predicate 'subsystem == "com.postproduction.Audium"'`
+returned zero lines for an entire real transcription run (whisper.cpp on Zeus/Intel) despite the
+unconditional `AudiumLog` calls that should have fired — `log show --predicate 'process ==
+"Audium"'` for the same window returned 1000+ system-subsystem lines, so unified logging itself
+was working, just not this app's own subsystem. Not root-caused. If `log show` verification for
+`AudiumLog`'s own subsystem/categories comes up empty again, don't assume the feature under test
+silently failed — cross-check via screenshot/on-disk evidence before concluding anything, same as
+this session did.

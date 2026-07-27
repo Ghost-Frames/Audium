@@ -85,10 +85,22 @@ feature ideas gathered from evaluating Scriberr/StoryToolkitAI.
 ### Transcription
 - One `TranscriptionProvider` protocol, e.g.
   `protocol TranscriptionProvider { func transcribe(audio: URL) async throws -> Transcript }`
-- Three implementations, user-selectable per job or as a default in Settings:
-  - `WhisperKitProvider` — local, on-device, free, private. Default. Package:
+- Four implementations, user-selectable per job or as a default in Settings:
+  - `WhisperKitProvider` — local, on-device, free, private. Default on Apple Silicon. Package:
     `argmax-oss-swift` (formerly WhisperKit), product `WhisperKit`. CoreML/Metal-accelerated,
-    replaces WhisperX/Python entirely.
+    replaces WhisperX/Python entirely. **Unsupported on Intel Macs** — SIGSEGVs before
+    compute-unit dispatch (spec §5, Known Issues) — `WhisperCppProvider` below is the local
+    fallback there.
+  - `WhisperCppProvider` — local, on-device, CPU-only, added **2026-07-27** specifically to give
+    Intel Macs (Zeus) a working local transcription option since `WhisperKitProvider` remains
+    blocked there. **Architecture decision**: bundled as a static binary
+    (`Resources/bin/whisper-cli`, built from `ggml-org/whisper.cpp` with
+    `-DBUILD_SHARED_LIBS=OFF`), same pattern as `ffmpeg`/`yt-dlp` — **not** WhisperX/Python. This
+    keeps the zero-dependency/no-Python principle intact (the same principle
+    `WhisperKitProvider`'s own doc comment already invokes — "replaces WhisperX/Python
+    entirely") rather than reversing it just because this one provider needed a CPU fallback.
+    Full research/implementation detail, citations, and real Intel-hardware test results in the
+    dedicated subsection below ("whisper.cpp local transcription provider — implemented").
   - `GeminiTranscriptionProvider` — cloud, via Gemini API's native multimodal audio input
     (Gemini accepts audio files directly as an input type). Uses user's Gemini API key.
   - `OpenAIWhisperAPIProvider` — cloud, via OpenAI's `/v1/audio/transcriptions` endpoint (or
@@ -98,10 +110,10 @@ feature ideas gathered from evaluating Scriberr/StoryToolkitAI.
     capability. Claude stays in the `AIProvider` role only (cleanup/summarize/chat on
     already-transcribed text).
 - Local WhisperKit model files downloaded on first use, not bundled in the `.app`/DMG (see
-  Resolved Decisions).
+  Resolved Decisions) — same principle extended to whisper.cpp's GGML model files.
 - Cloud providers (Gemini/OpenAI transcription) are a deliberate tradeoff against the
   local-first/private-by-default principle — clearly labeled as such in the picker UI, not
-  defaulted to.
+  defaulted to. whisper.cpp keeps that principle intact on hardware where WhisperKit can't.
 
 ### Diarization
 - **SpeakerKit** (Argmax) — ships in the same `argmax-oss-swift` package as WhisperKit,
@@ -237,7 +249,110 @@ flat `.cornerRadius(8)` cards).
   a clear message, or steer default to cloud transcription (Gemini/OpenAI) on unsupported
   hardware. Not blocking other work — proceeding with hardware-agnostic features in the
   meantime (SpeakerKit, cloud transcription providers, export, AI provider panel).
-- **New, separate bug** (real GUI, 2026-07-22): WhisperKit transcription fails with
+  **Local-fallback fix shipped 2026-07-27** — see the dedicated subsection below ("whisper.cpp
+  local transcription provider — implemented") — WhisperKit on Intel itself stays broken
+  (upstream, not something this app can fix), but Intel Macs now have a real working local
+  option instead of only cloud providers.
+
+### whisper.cpp local transcription provider — implemented (2026-07-27)
+
+Gives Zeus (Intel) a working local transcription option since `WhisperKitProvider` remains
+SIGSEGV-blocked there (above). Implementation in the new `WhisperCppProvider.swift`.
+
+**Architecture decision** (made with the user before implementation, documented per spec §3):
+bundle `whisper.cpp` as a static binary in `Resources/bin/`, same pattern as `ffmpeg`/`yt-dlp` —
+explicitly **not** WhisperX/Python. Keeps the zero-dependency/no-Python principle intact rather
+than reversing it for one provider's sake.
+
+**Research performed before writing any code** (per explicit instruction, same discipline as the
+EDL exporter's research — live-checked, not assumed):
+- **No official prebuilt macOS CLI binary exists.** Checked directly against the GitHub Releases
+  API (`api.github.com/repos/ggml-org/whisper.cpp/releases/latest`, not just the web page, which
+  failed to render its asset list) — the actual asset list is Linux (arm64/x64), Windows
+  (Win32/x64, BLAS/CUDA variants), and a `whisper-v1.9.1-xcframework.zip` (an Xcode-only Swift/
+  ObjC library target, not a standalone CLI executable — doesn't fit "shell out to a bundled
+  binary"). No macOS CLI archive, unlike `ffmpeg`/`yt-dlp` which do ship prebuilt static
+  binaries. Confirms the task's anticipated fallback ("build instructions if no static binary is
+  published") was the right path, not an assumption.
+  **Built from source instead** — cloned `ggml-org/whisper.cpp`, configured with
+  `cmake -B build -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=OFF
+  -DWHISPER_COREML=OFF` (confirmed via the project's own README: default CMake build is CPU-only,
+  CoreML is opt-in only via `-DWHISPER_COREML=1`, never enabled here — the whole point is *no*
+  ANE/CoreML dependency, the exact thing that crashes `WhisperKitProvider`), built with
+  `cmake --build build -j --config Release`. `otool -L` on the resulting `whisper-cli` confirms
+  it only links `libSystem`, `Accelerate.framework`, and `libc++` — all system frameworks, no
+  bundled third-party dylibs needed alongside it, satisfying the "static binary" requirement the
+  same way `ffmpeg`/`yt-dlp` already do (they also link only system libs, just ship no bundled
+  dylibs). x86_64-only, same tradeoff `ffmpeg`'s own evermeet.cx build already has (runs on Apple
+  Silicon via Rosetta 2 if ever needed there, though the point of this provider is Intel).
+- **Audio format support**: whisper.cpp's built-in decoder (miniaudio) only reads flac/mp3/ogg/wav
+  natively — confirmed by testing directly against a real `.aiff` file before writing any Swift
+  code (`read_audio_data: failed to read audio data`). This app's actual inputs are AIFF
+  (drag-and-drop) and M4A (`extractedAudioURL`'s video exports), neither supported. Fixed by
+  pre-converting to 16kHz mono WAV via the already-bundled `ffmpeg` (same binary
+  `YouTubeDownloader` already uses) before invoking `whisper-cli` — reuses existing bundled
+  infrastructure rather than adding a second audio-decoding dependency.
+- **CLI output format**: `-oj`/`--output-json` (not `-ojf`/full — per-token detail isn't needed,
+  diarization is `SpeakerKit`'s job, not whisper.cpp's own `-di`/`-tdrz` flags) writes
+  `<outputBase>.json` with a `{ transcription: [{ offsets: { from, to }, text }] }` shape,
+  offsets in **milliseconds** — confirmed against whisper.cpp's own
+  `examples/cli/cli.cpp` source (fetched directly, not assumed) and cross-checked by actually
+  running `whisper-cli -oj` against the repo's own `samples/jfk.wav` and inspecting the real
+  output file before writing the Swift parser.
+- **GGML model hosting**: `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-<model>.bin`
+  — confirmed via the project's own `models/download-ggml-model.sh` script (its `src`/`pfx`
+  variables), replicated as a plain `URLSession.download(from:)` in `WhisperCppModelManager`
+  rather than shelling out to their bash script.
+
+**Model handling**: `WhisperCppModel` (tiny/base/small/medium, `.en` and multilingual, plus
+large-v1/v2/v3/v3-turbo — quantized variants left out, not requested) + `WhisperCppSettings`
+(persisted default, same pattern as `WhisperModelSettings`) + `WhisperCppModelManager`
+(download-on-first-use into `~/Library/Application Support/Audium/whisper-cpp-models/`, same
+"not bundled" principle as WhisperKit's own models). Default `base.en` — reasonable speed/
+accuracy balance for CPU-only inference with no GPU/ANE acceleration. Settings gained a
+"whisper.cpp Model Size" section mirroring the existing WhisperKit one.
+
+**Provider picker + default-suggestion logic**: added to both the Settings radio picker and the
+runtime `switch` in `ContentView.runTranscription`. The existing "steer away from WhisperKit on
+unsupported hardware" `onAppear` check (spec §5, already existed for the SIGSEGV) now steers to
+**whisper.cpp**, not a cloud provider, when `HardwareCapability.hasNeuralEngine` is false — it's
+the local/private-by-default option that actually works on that hardware, closer to the app's
+local-first principle than defaulting to a cloud API key requirement. Only fires when the
+*persisted* default is still `.whisperKit` (the original migration-safety-net condition,
+unchanged) — doesn't override an already-deliberate Gemini/OpenAI choice a user made themselves.
+
+**Real GUI test on Zeus (Intel iMac20,2)** — the actual point of this feature:
+1. Confirmed `whisper-cli` signed correctly in the built app bundle (`codesign -dv`).
+2. Settings → Default Transcription Provider: new "whisper.cpp (local, CPU)" option present,
+   WhisperKit still correctly disabled/flagged unsupported, explanatory text updated. Selected
+   whisper.cpp explicitly; confirmed persisted (`defaults read
+   com.postproduction.Audium com.postproduction.Audium.defaultTranscriptionProvider` → `whisperCpp`).
+3. Real end-to-end transcription via Browse… (human-completed `NSOpenPanel` confirm, per the
+   established Powerbox-panel limitation) against a real `.aiff` test clip
+   (`interview_clip.aiff`) — **succeeded**: correct transcript text matching the real spoken
+   audio ("The first time I saw the building, I knew something was wrong." / "There was a light
+   on a window that shouldn't have had power at all.") rendered in the real Transcript panel,
+   `Speaker 0` labels present confirming `SpeakerKit` diarization ran successfully afterward,
+   waveform loaded and playable. This is the exact clip/machine combination where
+   `WhisperKitProvider` SIGSEGVs — whisper.cpp transcribed it cleanly.
+4. Independently confirmed via two separate signals rather than relying on the screenshot alone:
+   the GGML model landed at the exact expected path
+   (`~/Library/Application Support/Audium/whisper-cpp-models/ggml-base.en.bin`, 147MB, timestamped
+   right before completion), and `otool`/`codesign` confirmed the bundled binary itself was
+   correct going in.
+5. **`log show` anomaly, noted honestly rather than silently worked around**: `log show
+   --predicate 'subsystem == "com.postproduction.Audium"'` returned *zero* lines for this test
+   window (tried multiple time ranges up to 1 hour, with and without `--info`/`--debug`), despite
+   `AudiumLog.transcription.info(...)` calls unconditionally firing at the very start of
+   `WhisperCppProvider.transcribe(audio:)` — the same `Logger` pattern used successfully for
+   `log`-based verification throughout every earlier phase this session. `log show --predicate
+   'process == "Audium"'` for the same window *did* return over 1000 lines, all system-subsystem
+   (CoreAudio, AppKit) — so unified logging itself was working for this process, just not
+   surfacing this app's own subsystem's entries for reasons not root-caused. Not treated as
+   blocking: the screenshot evidence (a genuinely correct transcript that could only have been
+   produced by successfully running the real pipeline end-to-end) and the independent model-file
+   confirmation are definitive on their own. Worth investigating in a future session if `log
+   show` verification is needed again and comes up similarly empty.
   `Multiple models found matching "*openai*/*" in Repo(id: "argmaxinc/whisperkit-coreml", ...)`
   — a model-repo lookup ambiguity, distinct from the SIGSEGV (fails earlier, before decode).
   **Fixed** — root cause: `WhisperModelSettings.selectedVariant`'s `UserDefaults.string(forKey:)`

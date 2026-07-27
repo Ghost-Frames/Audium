@@ -348,7 +348,7 @@ struct OpenAIWhisperAPIProvider: TranscriptionProvider {
 }
 
 enum TranscriptionProviderKind: String {
-    case whisperKit, gemini, openAI
+    case whisperKit, whisperCpp, gemini, openAI
 }
 
 /// Persists the user's default transcription provider (spec §5) — separate from
