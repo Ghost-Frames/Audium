@@ -277,3 +277,18 @@ discipline) or the interchange-format/live-research practices above — it's an 
 correct fact-check both miss: the underlying design decision itself being subtly wrong. Simple UI
 additions (a button, a label, a layout tweak) don't need this — reserve it for the invariant-heavy
 category described above.
+
+**Standing practice (as of 2026-07-28): minimize self-driven GUI automation during testing.**
+Default now: for any test needing GUI interaction, hand the user a numbered list of exact manual
+steps ("1. Click X, 2. Drag Y into Z, 3. Tell me what you see"), then verify the RESULT via logs,
+on-disk file inspection, or one screenshot the user shares — not multi-step automated click/drag/
+screenshot loops driven via `cliclick`/`osascript`/AXPress. Reasons: (1) token/session cost — a
+screenshot-click-verify automation loop burns significant budget over a long session; (2)
+reliability — AX automation has been the least reliable part of this project's testing throughout
+(coordinate collisions between panels, drag failures, focus fights sending keystrokes to the wrong
+app, multi-retry loops, a destructive-confirm dialog triggered by a positional misclick), while
+user-driven testing is both faster and more accurate; (3) generalizes a boundary already
+established for the OS-protected cases (`NSSavePanel`/`NSOpenPanel`, Finder-drag, `List`
+drag-to-reorder, `SecureField` entry) to ordinary clicks and navigation too. Reserve actual GUI
+automation for cases where it's genuinely faster/more reliable than asking the user — rare — not
+as the default approach.
