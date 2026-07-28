@@ -1294,6 +1294,83 @@ rather than assuming the wholesale import was already correctly scoped.
   2026-07-24 pass above); this pass's new-information check was the count/grouping/search
   behavior against the changed data set, which is what could plausibly have broken.
 
+### Batch/folder transcription — implemented (2026-07-27)
+
+The next roadmap item after Parakeet's removal (§9). Lets a user select a whole folder of source
+media, or multi-select several files at once, and add/transcribe them all in one action instead of
+one drag-and-drop at a time.
+
+**Entry point**: a new "Add Files/Folder…" button in `ProjectBrowserPanel`, next to "+ New Folder"
+(only enabled once a folder is selected — same precondition single drag-and-drop already has).
+Named "Add Files/Folder…" rather than the roadmap's suggested "Add Folder…" since one `NSOpenPanel`
+genuinely does both jobs: `canChooseFiles`/`canChooseDirectories`/`allowsMultipleSelection` all
+`true` together — Cocoa keeps directories selectable and navigable regardless of
+`allowedContentTypes` (which only filters/dims non-matching regular files, confirmed by the corrupt
+`.mp3` in testing below still showing up enabled since it has a valid extension), so folder-picking
+isn't blocked by the audio/video type filter used for files. A selected directory is expanded via
+`FileManager.enumerator` (recursive — a real dailies folder commonly has per-scene/per-day
+subfolders), filtering to `UTType`s conforming to `.audiovisualContent`, then flattened with any
+directly-selected files into one sorted, deterministic `[URL]` list (`expandToMediaFiles` in
+`ContentView.swift`).
+
+**Pipeline reuse — no second pipeline built**: the batch loop (`ingestBatch`) calls the exact same
+`project.addDaily(from:to:)` + `runTranscription(on:dailyID:)` per file that a single drag-and-drop
+already uses, just in a `for` loop instead of once. Sequential, not concurrent — deliberately, per
+the task's own reasoning: hammering a cloud API (Gemini/OpenAI) with N simultaneous requests or
+running N local WhisperKit/whisper.cpp jobs at once would be the wrong default, and nothing in this
+app's architecture assumes concurrent transcriptions today.
+
+**Progress UI — extended the existing phase-label system, not a new one**: `runTranscription`
+already drives `status`/`statusFraction`/`isTranscribing`, rendered by the existing
+`TranscriptionProgressView`. Batch adds exactly one new piece of state, `batchProgressText` ("File 3
+of 12 — clip_004.mov"), threaded through as a new optional `batchProgress` parameter on
+`TranscriptionProgressView`, `WaveformPanel`, and `TranscriptPanel` — rendered as one extra bold-
+accent line above the existing phase text, `nil` (and therefore invisible) for the ordinary
+single-file case. The per-file phase text (`"Preparing audio…"`, `"Transcribing…"`, elapsed-seconds
+counter, etc.) is completely unchanged and still updates normally for whichever file the batch is
+currently on.
+
+**Partial failure handling**: `runTranscription` was changed from returning `Void` to returning
+`String?` (`@discardableResult`, so the two existing single-file callers — `ingest`/
+`retranscribeCurrent` — need no changes) — `nil` on success, the failure description on error. Two
+distinct failure points exist per batch item and both are caught without aborting the queue:
+`project.addDaily`'s file copy can throw (unreadable/permission-denied source), and
+`runTranscription`'s returned message covers a provider-side failure on an otherwise-successfully-
+copied file (bad audio data, a cloud API error, etc.). Both are recorded into `batchFailures` and
+the loop continues to the next file regardless. Once the whole batch finishes, one summary `.alert`
+lists every failed filename + its real error message — deliberately *one* alert at the end rather
+than one modal per failure, so a bad file in the middle of 12 doesn't force a dismiss-to-continue
+interruption partway through.
+
+**Real batch test** (signed `build/Audium.app`, existing "Audium Smoke Test Project"): built a real
+4-file test batch — `clip_a_interview.aiff`/`clip_b_scene1.aiff` (copies of existing real test
+audio), `clip_c_video.mp4` (a real test video), and `clip_d_corrupt.mp3` (2KB of `/dev/urandom` with
+a valid-looking `.mp3` extension — the deliberately-broken-file case the task asked for). Selected
+all 4 via the new "Add Files/Folder…" panel (multi-select, not the folder-picking path, in this
+pass) and confirmed, end to end:
+- All 4 were added as Dailies immediately (including the corrupt one — `addDaily`'s copy is just
+  bytes, corruption only surfaces later at the actual decode step, exactly as expected).
+- The batch progress line ("File 1 of 4 — clip_a_interview.aiff", counting up correctly) rendered
+  correctly in both the Waveform panel's busy-status line and the Transcript panel's
+  `TranscriptionProgressView`, alongside the normal per-file phase text, through all 4 files.
+- Files 1, 2, 3 (the two `.aiff`s and the `.mp4`) transcribed successfully — the video file's audio
+  track extraction (existing `extractedAudioURL` path, unchanged) worked inside the batch loop
+  exactly as it does for a single video drag-and-drop, confirmed by opening that Daily afterward and
+  seeing its real transcribed text plus the video Preview panel (not Waveform), not just an audio
+  fallback.
+- File 4 (the corrupt one) failed with a real, specific error surfaced from the actual pipeline —
+  `ffmpeg`'s own stderr: `"Format mp3 detected only with low score of 1, misdetection possible!"` /
+  `"Failed to find two consecutive MPEG audio frames"` / `"Error opening input: Invalid data found
+  when processing input"` — not a generic/swallowed failure message.
+- **The batch did not abort** — all 4 files were processed to completion, and the end-of-batch
+  summary alert correctly read "Batch Import: 1 file failed" with exactly that file's real error
+  text, while the other 3 Dailies sit in the project with real transcripts, fully usable.
+- Test dailies and their on-disk media were removed after verification (direct `.audiumproject.json`
+  edit + file deletion — the in-app delete-confirmation dialogs proved unreliable to drive via
+  `System Events` clicks in this pass specifically, unlike other confirmation dialogs earlier in
+  this project's testing history; not investigated further since a human deleting test data via the
+  UI works fine and this was just cleanup, not the feature under test).
+
 ### AI Chat header overflow bug — fixed (2026-07-23)
 
 Adding the role picker (above) to `AIChatPanel`'s header row made "AI Chat" render as a
@@ -1446,13 +1523,43 @@ Rough phase order, to be refined as each lands:
    present system font) — verified in real Microsoft Word and real Apple Pages, not just structural
    checks. See the dedicated subsection above ("`.docx` export — implemented") for full detail.
    This was the last unimplemented item from Section 2's original v2 export requirements.
+9. Batch/folder transcription — **complete (2026-07-27)**, reuses the existing `addDaily`/
+   `runTranscription` pipeline sequentially per file (no second pipeline), extends the existing
+   phase-label progress system with one added "File N of M" line, and handles partial failure
+   gracefully — verified with a real 4-file batch including a deliberately-corrupted file that
+   failed cleanly without aborting the other 3. See the dedicated subsection above ("Batch/folder
+   transcription — implemented") for full detail.
 
 ## 9. v2 Roadmap — Additional Items (not yet sequenced against Section 8 above)
 
-- **NVIDIA Parakeet** as an alternative local ASR engine alongside WhisperKit — CoreML-viable
-  on Apple Silicon, claimed ~20× faster than Whisper (per TranscribeX competitor research).
-  Slots into the existing `TranscriptionProvider` protocol as a fourth implementation
-  (`ParakeetProvider`) — no architecture change needed, same pattern as the existing four.
+- ~~**NVIDIA Parakeet** as an alternative local ASR engine alongside WhisperKit~~ — **rejected
+  (2026-07-27)**, real research reversed the original "~20× faster than Whisper" competitor-research
+  claim this bullet was based on. Kept here for the record rather than silently deleted, same
+  practice as the ScriptFixer bullet above.
+  - **No Intel path** — same limitation this app already works around for WhisperKit. Parakeet's
+    speed depends on Apple Silicon's Neural Engine; there's no mature, bundleable Intel-CPU
+    implementation equivalent to `whisper.cpp` (a genuine CPU-only path exists in principle —
+    `parakeet.cpp`/ONNX Runtime/OpenVINO ports — but none is an established, maintained binary
+    comparable to what this project already built and bundled for Whisper). Adding Parakeet would
+    mean redoing the whisper.cpp bundling effort from scratch for a second model, on Zeus's own
+    (Intel) machine specifically.
+  - **The speed claim doesn't hold up, and is implementation-dependent** — [one detailed real-world
+    benchmark](https://www.arunbaby.com/speech-tech/0073-whisper-vs-parakeet-asr-decision/) found
+    Parakeet via MLX **2.6× *slower*** than Whisper via CoreML for the same audio, and on an M4 Max
+    specifically: "consumed 22 GB of unified memory, pinned one of my efficiency cores at 100%, and
+    took 3x longer than faster-whisper to transcribe the same file." Meanwhile [a Parakeet-specific
+    CoreML port's own marketing](https://whispernotes.app/blog/parakeet-v3-default-mac-model) claims
+    10–23× *faster* than Whisper on the same Apple Silicon class of hardware. Both can't be
+    representative — the real takeaway is that Parakeet's Apple Silicon performance swings wildly
+    by implementation (MLX vs. a dedicated CoreML port), unlike WhisperKit/whisper.cpp's four
+    already-optimized, already-integrated paths in this app.
+  - **Narrower language support**: Parakeet-TDT's multilingual variant covers **25 European
+    languages** vs. Whisper's **99+** (same source as above) — a real regression for any non-English
+    transcription use case this app supports today.
+  - **Net**: not a clear win against what's already shipped (WhisperKit covers Apple Silicon,
+    whisper.cpp covers Intel, both mature/bundled/tested) — no architecture blocker if reconsidered
+    later (still slots into `TranscriptionProvider` as a fifth implementation with no protocol
+    change), but not worth building given the above.
 - **StoryToolkitAI-style features** — semantic/content search across transcripts, transcript
   groups, question detection. Deliberately deferred from v1 (see original scoping conversation)
   — revisit once core app is stable.
@@ -1464,6 +1571,7 @@ Rough phase order, to be refined as each lands:
   as the cue line. Left here for the record rather than silently rewritten, since it's a concrete
   example of why this project's standing practice requires checking real sources for interchange
   formats instead of trusting recollection.
-- Batch/folder auto-detect transcription (competitor-validated as a common expectation, not
-  currently in v1 scope)
+- Batch/folder transcription (competitor-validated as a common expectation) — **complete
+  (2026-07-27)**, see §8's "Batch/folder transcription — implemented" subsection for full detail
+  and real 4-file test results (including a deliberately-corrupted file handled gracefully).
 

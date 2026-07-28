@@ -10,9 +10,11 @@ v1 (transcription core) is feature-complete and pre-release-cleaned. v2 is under
 toward a project-based story-editing tool — screen dailies, transcribe, mark highlights, and
 assemble a paper edit without opening Avid/Premiere/Resolve. See `docs/spec.md` Section 8 for
 the full v2 architecture (Project/Daily/Highlight/Paper Edit data model, video playback, CMX3600
-EDL export, ScriptFixer/ScriptSync export, `.docx` export, AI Chat "Roles"). All original v2
-export requirements are now complete (TXT/SRT/VTT/ScriptSync/`.docx` transcript export, EDL/`.docx`
-Paper Edit export).
+EDL export, ScriptFixer/ScriptSync export, `.docx` export, batch/folder transcription, AI Chat
+"Roles"). All original v2 export requirements are now complete (TXT/SRT/VTT/ScriptSync/`.docx`
+transcript export, EDL/`.docx` Paper Edit export). NVIDIA Parakeet was considered as a second local
+ASR engine and rejected (2026-07-27, real research — see spec.md §9) — no Intel path, contested/
+implementation-dependent Apple Silicon speed claims, narrower language support than Whisper.
 
 Always read `docs/spec.md` first, before investigating or changing anything. Check its
 "Known Issues" and "Resolved" sections (Section 5) before re-diagnosing something that may
@@ -115,3 +117,34 @@ Fixed by switching to `Helvetica`, a core Apple font guaranteed complete on ever
 actually open it with" are different claims, and a full-weight, real-application test is what this
 project's own testing standard already calls for — this session is a concrete case of that standard
 catching a real bug a structural check alone would have missed entirely.
+
+**Standing practice (as of 2026-07-27): a competitor/technology-choice claim carried in this spec
+from an earlier pass ("~20x faster") deserves the same live-research skepticism as any other
+unverified claim, not a pass just because it's already written down.** NVIDIA Parakeet was on the
+v2 roadmap (§9) as a second local ASR engine on the strength of a secondhand "~20x faster than
+Whisper" claim. Real research reversed it: no mature Intel-Mac path exists (Parakeet's speed
+depends on Apple Silicon's Neural Engine, same limitation this app already works around for
+WhisperKit via `whisper.cpp` — but no equivalent bundleable CPU implementation exists for Parakeet
+yet); the speed claim itself is contested and implementation-dependent (one detailed real-world
+benchmark found it 2.6x *slower* via MLX with heavy memory pressure, while a dedicated CoreML port
+claims 10-23x faster on the same hardware class); and its multilingual variant covers 25 languages
+against Whisper's 99+. Removed from the roadmap (not silently deleted — left in spec.md with the
+full reversal and citations, same treatment as the ScriptFixer memory-correction entry) rather than
+built. This is the same "spec.md is not itself a verified source" lesson as the ScriptFixer entry
+above, applied to a technology/architecture decision instead of a file-format convention.
+
+**Standing practice (as of 2026-07-27): `System Events` AX automation that works for one kind of
+confirmation dialog in this app doesn't necessarily work for another, even a structurally similar
+one** — `NSSavePanel`'s Save button and custom SwiftUI `.alert`/`.confirmationDialog` sheets have
+both been driven successfully via `click item N of UI elements of <sheet>` earlier in this
+project's testing history, but the exact same pattern against `ProjectBrowserPanel`'s "Delete
+Daily" confirmation dialog silently didn't take effect in this session (the dailies remained after
+what looked like a successful click, with no error from `osascript`) — root cause not investigated,
+since it was just batch-test cleanup, not the feature under test. Worked around by editing
+`.audiumproject.json` directly (removing the stray entries) plus deleting the orphaned media files
+by hand rather than fighting the automation further. If a future session hits the same "click
+reported success but nothing changed" pattern on a confirmation dialog, verify the actual
+before/after state (don't trust a clean `osascript` exit code alone) and be ready to fall back to
+direct data manipulation for cleanup — same spirit as the existing NSSavePanel/List-drag-reorder
+permanent notes, one more concrete case that AX automation reliability in this app is per-control,
+not global.

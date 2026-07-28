@@ -26,6 +26,14 @@ struct ContentView: View {
     /// standalone/no-project file). Lets "Re-transcribe" and folder/daily deletion know which
     /// on-disk Daily — if any — the currently-displayed transcript actually belongs to.
     @State private var currentDailyID: UUID?
+    /// Batch/folder ingest (spec §9) — sequential, not concurrent (avoids hammering cloud APIs or
+    /// overloading local transcription), reusing the exact same `addDaily`/`runTranscription` pipeline
+    /// per file as a single drag-and-drop. `batchTotal == 0` means no batch is running.
+    @State private var batchTotal = 0
+    @State private var batchIndex = 0
+    @State private var batchCurrentName = ""
+    @State private var batchFailures: [(name: String, error: String)] = []
+    @State private var showingBatchSummary = false
     /// Shared with the Paper Edit window (spec §8) — owned by `AudiumApp`, not this view, so both
     /// windows drive the same playback engine/project state instead of separate copies.
     @EnvironmentObject private var playback: AudioPlaybackController
@@ -42,10 +50,24 @@ struct ContentView: View {
     private static let minWaveformHeight: CGFloat = 160
     private static let minTranscriptHeight: CGFloat = 220
 
+    /// "File 3 of 12 — clip_004.mov", layered alongside the existing per-file `status`/
+    /// `statusFraction` phase display rather than replacing it (spec §9: "extend the existing
+    /// progress/phase-label system"). `nil` when no batch is running, so it adds nothing to the
+    /// UI for the ordinary single-file case.
+    private var batchProgressText: String? {
+        guard batchTotal > 0 else { return nil }
+        return "File \(batchIndex) of \(batchTotal) — \(batchCurrentName)"
+    }
+
     var body: some View {
         HStack(spacing: 16) {
-            ProjectBrowserPanel(project: project, onSelectDaily: loadDaily, onDailyDeleted: clearLoadedContentIfMatches)
-                .frame(width: 240)
+            ProjectBrowserPanel(
+                project: project,
+                onSelectDaily: loadDaily,
+                onDailyDeleted: clearLoadedContentIfMatches,
+                onAddBatch: { urls in Task { await ingestBatch(urls) } }
+            )
+            .frame(width: 240)
             GeometryReader { geo in
                 let maxWaveformHeight = max(Self.minWaveformHeight, geo.size.height - Self.minTranscriptHeight - 12)
                 let clampedHeight = min(max(CGFloat(waveformPanelHeight), Self.minWaveformHeight), maxWaveformHeight)
@@ -59,7 +81,8 @@ struct ContentView: View {
                         error: youtubeError,
                         onSubmitURL: { Task { await runYouTubeTranscription(urlString: youtubeURLText) } },
                         onBrowse: browseForFile,
-                        onRetranscribe: { Task { await retranscribeCurrent() } }
+                        onRetranscribe: { Task { await retranscribeCurrent() } },
+                        batchProgress: batchProgressText
                     )
                     .frame(height: clampedHeight)
                     .onDrop(of: [.audiovisualContent], isTargeted: $isDropTargeted, perform: handleDrop)
@@ -77,7 +100,8 @@ struct ContentView: View {
                         dailyID: currentDailyID,
                         onToggleHighlight: toggleHighlight,
                         onRemoveHighlight: removeHighlight,
-                        onAddToPaperEdit: addToPaperEdit
+                        onAddToPaperEdit: addToPaperEdit,
+                        batchProgress: batchProgressText
                     )
                 }
             }
@@ -109,6 +133,14 @@ struct ContentView: View {
                 }
                 .help("Settings")
             }
+        }
+        // Batch/folder ingest failure summary (spec §9) — surfaced once at the end of a batch
+        // rather than one alert per failed file, so a bad file in the middle of 12 doesn't
+        // interrupt the rest of the queue with a modal that has to be dismissed to continue.
+        .alert("Batch Import: \(batchFailures.count) file\(batchFailures.count == 1 ? "" : "s") failed", isPresented: $showingBatchSummary) {
+            Button("OK", role: .cancel) { batchFailures = [] }
+        } message: {
+            Text(batchFailures.map { "\($0.name): \($0.error)" }.joined(separator: "\n"))
         }
     }
 
@@ -264,8 +296,12 @@ struct ContentView: View {
         statusFraction = nil
     }
 
+    /// Returns the failure message if transcription failed, `nil` on success — lets batch ingest
+    /// (below) record a per-file failure and continue the queue instead of the failure only ever
+    /// surfacing as a `status` string single-file callers don't need to inspect.
     @MainActor
-    private func runTranscription(on url: URL, dailyID: UUID? = nil) async {
+    @discardableResult
+    private func runTranscription(on url: URL, dailyID: UUID? = nil) async -> String? {
         isTranscribing = true
         if transcriptionStartedAt == nil { transcriptionStartedAt = Date() }
         segments = []
@@ -299,6 +335,7 @@ struct ContentView: View {
             provider = openAI
         }
 
+        var failureMessage: String?
         do {
             // Video dailies (spec §8) get their audio track extracted first — every provider
             // reads its input as an audio file, and playback (above) already got the original
@@ -310,11 +347,51 @@ struct ContentView: View {
             status = "\(segments.count) segments"
             if let dailyID { project.updateDailyTranscript(dailyID, segments: transcript.segments) }
         } catch {
+            failureMessage = error.localizedDescription
             status = "Transcription failed: \(error.localizedDescription)"
         }
         statusFraction = nil
         isTranscribing = false
         transcriptionStartedAt = nil
+        return failureMessage
+    }
+
+    /// Batch/folder ingest (spec §9) — sequential (not concurrent, so this doesn't hammer a cloud
+    /// API or run several local transcriptions at once), reusing `project.addDaily` +
+    /// `runTranscription` per file exactly as a single drag-and-drop already does. One bad file
+    /// (unreadable, unsupported format, a provider/API error) is caught and recorded rather than
+    /// aborting the rest of the queue — `addDaily`'s copy can throw (bad/corrupt file) and
+    /// `runTranscription`'s returned failure message covers a provider-side failure on an otherwise
+    /// valid file, so both failure points during a batch item are covered.
+    @MainActor
+    private func ingestBatch(_ urls: [URL]) async {
+        guard project.metadata != nil else {
+            status = "Open a project first — batch import adds each file as a Daily"
+            return
+        }
+        guard let folderID = project.selectedFolderID else {
+            status = "Select or create a project folder first"
+            return
+        }
+        batchFailures = []
+        batchTotal = urls.count
+        for (index, url) in urls.enumerated() {
+            batchIndex = index + 1
+            batchCurrentName = url.lastPathComponent
+            do {
+                let (daily, mediaURL) = try await project.addDaily(from: url, to: folderID)
+                currentDailyID = daily.id
+                if let failure = await runTranscription(on: mediaURL, dailyID: daily.id) {
+                    batchFailures.append((url.lastPathComponent, failure))
+                }
+            } catch {
+                batchFailures.append((url.lastPathComponent, error.localizedDescription))
+            }
+        }
+        batchTotal = 0
+        batchIndex = 0
+        batchCurrentName = ""
+        if !batchFailures.isEmpty { showingBatchSummary = true }
     }
 
 }
@@ -327,6 +404,10 @@ private struct ProjectBrowserPanel: View {
     @ObservedObject var project: ProjectController
     let onSelectDaily: (Daily, ProjectFolder) -> Void
     let onDailyDeleted: (UUID) -> Void
+    /// Batch/folder ingest (spec §9) — a flat, already-expanded list of media file URLs (any
+    /// selected folders already walked and filtered down to media files by `addBatch()` below);
+    /// the caller (`ContentView`) owns the actual sequential add+transcribe queue.
+    let onAddBatch: ([URL]) -> Void
 
     @State private var errorText: String?
     @State private var showingNewFolderAlert = false
@@ -399,6 +480,13 @@ private struct ProjectBrowserPanel: View {
             Button("+ New Folder") { showingNewFolderAlert = true }
                 .font(.caption.bold())
                 .buttonStyle(.accent)
+            // Batch/folder ingest (spec §9) — one panel handles both "pick a whole folder of
+            // dailies" and "multi-select several files at once", added into the currently
+            // selected folder same as a single drag-and-drop would be.
+            Button("Add Files/Folder…") { addBatch() }
+                .font(.caption.bold())
+                .buttonStyle(.accent)
+                .disabled(project.selectedFolderID == nil)
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(project.metadata?.folders ?? []) { folder in
@@ -512,6 +600,49 @@ private struct ProjectBrowserPanel: View {
         }
     }
 
+    /// One `NSOpenPanel` handles both "select a whole folder of dailies" and "multi-select several
+    /// files at once" (spec §9) — `canChooseDirectories`/`canChooseFiles`/`allowsMultipleSelection`
+    /// all true together; Cocoa keeps directories selectable regardless of `allowedContentTypes`,
+    /// which only filters which regular files are enabled, so folder-picking isn't blocked by the
+    /// audio/video type filter. Selected directories are expanded to their contained media files
+    /// before handing off — the caller only ever sees a flat file list.
+    private func addBatch() {
+        let panel = NSOpenPanel()
+        panel.title = "Add Files or a Folder of Dailies"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.audiovisualContent]
+        guard panel.runModal() == .OK else { return }
+        let urls = expandToMediaFiles(panel.urls)
+        guard !urls.isEmpty else { return }
+        onAddBatch(urls)
+    }
+
+    /// Walks any selected directories recursively (a dailies folder commonly has per-scene/per-day
+    /// subfolders) and keeps only files whose UTType conforms to `.audiovisualContent` — the same
+    /// type filter the single-file `Browse…`/drop path already uses. Plain files in the selection
+    /// pass through unchanged. Sorted by filename for a deterministic, reproducible batch order.
+    private func expandToMediaFiles(_ urls: [URL]) -> [URL] {
+        var result: [URL] = []
+        let fm = FileManager.default
+        for url in urls {
+            var isDirectory: ObjCBool = false
+            guard fm.fileExists(atPath: url.path, isDirectory: &isDirectory) else { continue }
+            if isDirectory.boolValue {
+                guard let enumerator = fm.enumerator(at: url, includingPropertiesForKeys: [.contentTypeKey], options: [.skipsHiddenFiles]) else { continue }
+                for case let fileURL as URL in enumerator {
+                    guard let type = try? fileURL.resourceValues(forKeys: [.contentTypeKey]).contentType,
+                          type.conforms(to: .audiovisualContent) else { continue }
+                    result.append(fileURL)
+                }
+            } else {
+                result.append(url)
+            }
+        }
+        return result.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
     private func createFolder() {
         let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
         newFolderName = ""
@@ -575,6 +706,8 @@ private struct WaveformPanel: View {
     let onSubmitURL: () -> Void
     let onBrowse: () -> Void
     let onRetranscribe: () -> Void
+    /// "File 3 of 12 — clip.mov" while a batch/folder ingest is running (spec §9); `nil` otherwise.
+    let batchProgress: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -598,6 +731,11 @@ private struct WaveformPanel: View {
     private var entryContent: some View {
         VStack(alignment: .leading, spacing: 8) {
             Spacer()
+            if let batchProgress {
+                Text(batchProgress)
+                    .font(.caption.bold())
+                    .foregroundStyle(Theme.accent)
+            }
             Text(status)
                 .foregroundStyle(.secondary)
             if let error {
@@ -664,6 +802,11 @@ private struct WaveformPanel: View {
                     .disabled(isBusy)
                 Spacer()
                 if isBusy {
+                    if let batchProgress {
+                        Text(batchProgress)
+                            .font(.caption.bold())
+                            .foregroundStyle(Theme.accent)
+                    }
                     Text(status)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -802,6 +945,8 @@ private struct TranscriptPanel: View {
     let onToggleHighlight: (TranscriptSegment) -> Void
     let onRemoveHighlight: (UUID) -> Void
     let onAddToPaperEdit: (Highlight, UUID?) -> Void
+    /// "File 3 of 12 — clip.mov" while a batch/folder ingest is running (spec §9); `nil` otherwise.
+    let batchProgress: String?
 
     /// Last segment whose start falls at or before the playhead — the one currently playing
     /// (spec §2: "clickable transcript sync"). A linear scan over a few hundred segments at most,
@@ -831,7 +976,7 @@ private struct TranscriptPanel: View {
                 }
             }
             if isTranscribing {
-                TranscriptionProgressView(phase: status, fraction: statusFraction, startedAt: startedAt)
+                TranscriptionProgressView(phase: status, fraction: statusFraction, startedAt: startedAt, batchProgress: batchProgress)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if segments.isEmpty {
                 Spacer()
@@ -878,6 +1023,9 @@ private struct TranscriptionProgressView: View {
     let phase: String
     let fraction: Double?
     let startedAt: Date?
+    /// "File 3 of 12 — clip.mov" while a batch/folder ingest is running (spec §9); `nil`
+    /// otherwise — extends this existing phase-label view rather than a second progress display.
+    var batchProgress: String? = nil
 
     /// Past this many seconds with no determinate progress, hint that something may be stuck
     /// rather than leaving the user to guess (spec §2).
@@ -885,6 +1033,11 @@ private struct TranscriptionProgressView: View {
 
     var body: some View {
         VStack(spacing: 10) {
+            if let batchProgress {
+                Text(batchProgress)
+                    .font(.caption.bold())
+                    .foregroundStyle(Theme.accent)
+            }
             if let fraction {
                 ProgressView(value: fraction)
                     .tint(Theme.accent)
