@@ -266,6 +266,26 @@ final class ProjectController: ObservableObject {
         try? save()
     }
 
+    /// Renames every segment currently labeled `from` to `to` within one Daily's transcript —
+    /// diarization (SpeakerKit) assigns one label per detected voice across the whole transcript,
+    /// so correcting a mislabeled/generic name ("Speaker 0" → "Jane") should follow the same
+    /// grouping rather than only fixing the one segment that happened to be clicked. `to == nil`
+    /// clears the label back to unassigned for every matching segment (same as clearing a single
+    /// segment's speaker field). No-op if `dailyID` doesn't resolve or no segment matches `from`.
+    func renameSpeaker(from: String, to: String?, in dailyID: UUID) {
+        guard let (folderIndex, dailyIndex) = locateDaily(dailyID),
+              var segments = metadata?.folders[folderIndex].dailies[dailyIndex].transcript.segments else { return }
+        var changed = false
+        for index in segments.indices where segments[index].speaker == from {
+            segments[index].speaker = to
+            changed = true
+        }
+        guard changed else { return }
+        metadata?.folders[folderIndex].dailies[dailyIndex].transcript.segments = segments
+        try? save()
+        AudiumLog.project.info("Speaker renamed in daily \(dailyID.uuidString, privacy: .public): \(from, privacy: .public) -> \(to ?? "(cleared)", privacy: .public)")
+    }
+
     func addHighlight(_ highlight: Highlight, to dailyID: UUID) {
         guard let (folderIndex, dailyIndex) = locateDaily(dailyID) else { return }
         metadata?.folders[folderIndex].dailies[dailyIndex].highlights.append(highlight)

@@ -15,6 +15,11 @@ EDL export, ScriptFixer/ScriptSync export, `.docx` export, batch/folder transcri
 transcript export, EDL/`.docx` Paper Edit export). NVIDIA Parakeet was considered as a second local
 ASR engine and rejected (2026-07-27, real research — see spec.md §9) — no Intel path, contested/
 implementation-dependent Apple Silicon speed claims, narrower language support than Whisper.
+Global speaker rename (editing one segment's speaker label renames every segment sharing that
+label, matching how diarization groups them) is implemented and real-GUI-tested (2026-07-28). The
+AI Chat Roles library was re-culled against the strictly-filmmaking/podcast/journalism criterion
+(2026-07-28): 402 → 302 skill files (100 removed, ~25%) — see standing practice below for what the
+prior "0 removed" pass missed.
 
 Always read `docs/spec.md` first, before investigating or changing anything. Check its
 "Known Issues" and "Resolved" sections (Section 5) before re-diagnosing something that may
@@ -102,6 +107,23 @@ removal to have something to show for the pass — see spec.md's "Roles scope na
 media-related" subsection for the full method and the 8 genuine journalism/editorial additions
 pulled from upstream instead (394 → 402 files, 0 removed).
 
+**Correction (2026-07-28): the "0 removed" conclusion above was itself too shallow, per direct user
+feedback — it checked every file for *any* media-adjacent keyword rather than judging each one
+against the actual stated criterion (strictly filmmaking/podcast/journalism).** Re-run properly:
+8 categories cut wholesale (newsletter, PR/communications, social media, image prompting, both
+translation categories, audience/distribution, YouTube — 83 files, all genuinely promotional/
+localization-business functions, not craft), 8 kept wholesale (clearly in scope), and the rest
+(research/writing/media-business/editing, plus `production-support` — a 5th category the user's own
+breakdown omitted entirely, flagged rather than silently guessed at) read file-by-file against the
+real criterion, not pattern-matched by name. Net: 402 → 302 (100 removed, ~25%) — a real cut this
+time. The lesson isn't "always find something to cut" (research/media-business/editing genuinely
+came back 100% kept on close reading, including subdirectories — `locations-logistics`, `media-
+competitive` — the user's own directive guessed would need trimming) — it's that **the bar is
+reading each file against the stated criterion, not a keyword sweep for relatedness**; both a false
+"nothing to cut" and a manufactured cut are failures of the same underlying shortcut. See spec.md's
+"Roles library re-culled against the actual criterion" subsection for the full per-category
+breakdown and reasoning.
+
 **Standing practice (as of 2026-07-27): a binary-format writer that produces structurally valid
 output (passes its own integrity check, gets identified correctly by `file`) can still be wrong in
 a way only the real target application would show — verify with the real application, not just the
@@ -148,3 +170,34 @@ before/after state (don't trust a clean `osascript` exit code alone) and be read
 direct data manipulation for cleanup — same spirit as the existing NSSavePanel/List-drag-reorder
 permanent notes, one more concrete case that AX automation reliability in this app is per-control,
 not global.
+
+**Standing practice (as of 2026-07-28): a `Delete "X" and everything in it?` confirmation dialog
+(and by extension any similarly-styled destructive-confirm dialog) is easy to trigger *by
+accident* via positional button-index guessing in a row that has more than one icon-only control**
+— during real-GUI-testing the speaker-rename feature, a positional guess intended to select a
+Daily row instead landed on that Daily's parent folder's delete-confirmation trigger, and the
+follow-up `click button "Cancel" of window "Audium"` (named lookup — the known -1728 issue) failed
+silently while the dialog was apparently still auto-advancing, and the folder + its seeded test
+media were actually deleted. No real harm (session-scratchpad test data), but it cost a full
+re-seed. **Before clicking anything in a row with multiple unlabeled icon buttons, check the
+`help` attribute** (`help of <button>` via System Events — distinct from `name`/`description`,
+which are usually `missing value` for SwiftUI's icon-only buttons) — it frequently carries the
+real accessibility label (e.g. `"Remove highlight"`, likely also `"Delete Folder"`-style text on
+destructive icons) where blind positional guessing risks a destructive action. Also confirmed this
+session, correcting an older permanent note below: plain keyboard **Escape does reliably dismiss**
+`NSOpenPanel`/`NSSavePanel` and (per this incident) still leaves a `.confirmationDialog` visually
+open rather than confirming it — but a *stale* AppleScript reference obtained before a dialog
+appeared (e.g. `window "Audium"` captured pre-dialog) can silently fail once the dialog changes
+the window's element tree; re-fetch the reference fresh after the dialog appears, same "re-derive
+after any layout change" lesson as the AXCell/List note above, now confirmed for confirmation
+dialogs specifically, not just static layout. Separately: entering any row's inline edit mode
+(e.g. this app's transcript speaker/text editing) inserts new `Done`/`Cancel` buttons into that
+row, shifting every subsequent button's index in the same scroll area — always re-fetch button
+indices after toggling an edit mode rather than reusing indices captured before it. And: plain
+`keystroke`/`key code` System Events commands target whatever the OS considers frontmost at the
+keyboard-input level, which can silently diverge from the app most recently `click`-ed via
+AXPress — in this session, keystrokes meant for a just-focused Audium `TextField` landed in a
+completely different application's text input instead, with no error from `osascript`. Setting
+`value of <text field>` directly plus `perform action "AXConfirm" of <text field>` avoided that
+whole class of misdirected-keystroke risk and is the safer default for scripted text entry in
+future sessions.

@@ -101,6 +101,7 @@ struct ContentView: View {
                         onToggleHighlight: toggleHighlight,
                         onRemoveHighlight: removeHighlight,
                         onAddToPaperEdit: addToPaperEdit,
+                        onRenameSpeaker: renameSpeaker,
                         batchProgress: batchProgressText
                     )
                 }
@@ -280,6 +281,21 @@ struct ContentView: View {
         guard let currentDailyID else { return }
         let targetID = paperEditID ?? project.addPaperEdit(name: "Paper Edit \((project.metadata?.paperEdits.count ?? 0) + 1)").id
         project.addPaperEditEntry(highlightID: highlight.id, dailyID: currentDailyID, to: targetID)
+    }
+
+    /// Renames every segment sharing the `from` speaker label, not just the one being edited —
+    /// diarization (SpeakerKit) assigns one label per detected voice across the whole transcript,
+    /// so a correction should follow the same grouping (spec §8, "global speaker rename"). Updates
+    /// the working `segments` copy directly (covers a standalone/no-project file too) and, when a
+    /// project Daily is loaded, persists via `ProjectController.renameSpeaker` the same way
+    /// highlight/paper-edit mutations already do.
+    private func renameSpeaker(from: String, to: String?) {
+        for index in segments.indices where segments[index].speaker == from {
+            segments[index].speaker = to
+        }
+        if let currentDailyID {
+            project.renameSpeaker(from: from, to: to, in: currentDailyID)
+        }
     }
 
     /// Clears the loaded-file state after the currently-displayed Daily is deleted out from under
@@ -945,6 +961,9 @@ private struct TranscriptPanel: View {
     let onToggleHighlight: (TranscriptSegment) -> Void
     let onRemoveHighlight: (UUID) -> Void
     let onAddToPaperEdit: (Highlight, UUID?) -> Void
+    /// Global speaker rename (spec §8) — `to == nil` clears the label. Applies to every segment
+    /// currently sharing `from`, not just the one edited.
+    let onRenameSpeaker: (_ from: String, _ to: String?) -> Void
     /// "File 3 of 12 — clip.mov" while a batch/folder ingest is running (spec §9); `nil` otherwise.
     let batchProgress: String?
 
@@ -995,7 +1014,8 @@ private struct TranscriptPanel: View {
                                     isHighlighted: highlights.contains { $0.start == segment.start },
                                     canHighlight: dailyID != nil,
                                     onSeek: { playback.seek(to: segment.start) },
-                                    onToggleHighlight: { onToggleHighlight(segment) }
+                                    onToggleHighlight: { onToggleHighlight(segment) },
+                                    onRenameSpeaker: onRenameSpeaker
                                 )
                                 .id(segment.id)
                             }
@@ -1092,6 +1112,10 @@ private struct SegmentRow: View {
     let canHighlight: Bool
     let onSeek: () -> Void
     let onToggleHighlight: () -> Void
+    /// Global speaker rename (spec §8) — see `TranscriptPanel`'s doc comment. Only fired when
+    /// editing changes an *existing* (non-empty) speaker label; assigning a label to a
+    /// previously-unlabeled segment has no group to rename and stays a single-segment edit.
+    let onRenameSpeaker: (_ from: String, _ to: String?) -> Void
 
     @State private var isEditingText = false
     @State private var isEditingSpeaker = false
@@ -1149,6 +1173,17 @@ private struct SegmentRow: View {
         isEditingSpeaker = true
     }
 
+    /// Fires the global rename only when the edit changed an *existing* label (`speakerSnapshot`
+    /// non-empty) to a different value — matches diarization's grouping (spec §8). Assigning a
+    /// label to a previously-unlabeled segment (`speakerSnapshot` empty) has no group to rename;
+    /// the live binding on the TextField below already applied that as a single-segment edit.
+    private func commitSpeakerEdit() {
+        let finalValue = segment.speaker ?? ""
+        guard finalValue != speakerSnapshot, !speakerSnapshot.isEmpty else { return }
+        onRenameSpeaker(speakerSnapshot, finalValue.isEmpty ? nil : finalValue)
+        speakerSnapshot = finalValue
+    }
+
     @ViewBuilder
     private var speakerField: some View {
         if isEditingSpeaker {
@@ -1162,13 +1197,19 @@ private struct SegmentRow: View {
             .frame(width: 110)
             .focused($speakerFieldFocused)
             .onAppear { speakerFieldFocused = true }
-            .onSubmit { isEditingSpeaker = false }
+            .onSubmit {
+                commitSpeakerEdit()
+                isEditingSpeaker = false
+            }
             .onExitCommand {
                 segment.speaker = speakerSnapshot.isEmpty ? nil : speakerSnapshot
                 isEditingSpeaker = false
             }
             .onChange(of: speakerFieldFocused) { _, focused in
-                if !focused { isEditingSpeaker = false }
+                if !focused {
+                    commitSpeakerEdit()
+                    isEditingSpeaker = false
+                }
             }
         } else {
             Button(segment.speaker ?? "+ speaker") { enterSpeakerEdit() }

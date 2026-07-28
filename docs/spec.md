@@ -614,14 +614,24 @@ handling of YouTube-downloaded dailies).
 
 Same category of macOS-enforced protection as the Secure Input Mode note above, discovered
 during this smoke test. An NSSavePanel/NSOpenPanel ("Powerbox"-mediated system panel) cannot be
-dismissed, confirmed, or cancelled via **any** synthetic input — tested exhaustively: cliclick at
-multiple coordinate calibrations, AXPress on its buttons, keyboard Return/Escape (single and
-double), Tab-to-focus-then-activate, even a synthetic drag of the panel's own title bar and its
-native traffic-light close button. None worked. Text entry into the filename field via synthetic
-keystroke *does* work — only the confirm/cancel action is blocked. Similarly, a Finder→app
-drag-and-drop can be initiated and correctly hovers/highlights a valid drop target
-programmatically, but the release/drop itself never delivers; the drag ghost persists until a
-separate standalone drag-up command visually clears it, without ever completing the actual drop.
+**confirmed** (its Open/Save button clicked to commit a selection) via **any** synthetic input
+tried so far — cliclick at multiple coordinate calibrations, AXPress on its buttons, Tab-to-
+focus-then-activate, even a synthetic drag of the panel's own title bar and its native
+traffic-light close button. Text entry into the filename field via synthetic keystroke *does*
+work — only the confirm action is blocked. Similarly, a Finder→app drag-and-drop can be initiated
+and correctly hovers/highlights a valid drop target programmatically, but the release/drop itself
+never delivers; the drag ghost persists until a separate standalone drag-up command visually
+clears it, without ever completing the actual drop.
+
+**Correction (2026-07-28, real re-test)**: the original version of this note also claimed
+keyboard Escape didn't work to *cancel* one of these panels. That's wrong — a plain
+`key code 53` (Escape) via System Events reliably dismissed both an `NSOpenPanel` ("Open
+Project…"/"Browse…"/"Choose Audio or Video File") and an `NSSavePanel` ("New Project…") in this
+session, repeatedly, confirmed each time via the window disappearing from `System Events`' window
+list. Per this project's own standing practice, a previously-written spec.md claim isn't itself a
+verified source — this one just hadn't been re-checked until now. What's still genuinely
+unconfirmed is committing a selection (clicking Open/Save itself); this session never needed to,
+since cancelling out and seeding project state directly on disk covered every case that came up.
 
 **Implication for future sessions**: any task requiring a New/Open Project dialog, an
 NSOpenPanel-based Browse action, or a Finder-to-Audium drag needs a real human at the mouse.
@@ -1294,6 +1304,128 @@ rather than assuming the wholesale import was already correctly scoped.
   2026-07-24 pass above); this pass's new-information check was the count/grouping/search
   behavior against the changed data set, which is what could plausibly have broken.
 
+### Roles library re-culled against the actual criterion, real cuts this time (2026-07-28)
+
+The 2026-07-27 audit above concluded "no removals warranted" — checking every file for *any*
+media-adjacent keyword, not judging each file against the actual stated criterion (strictly
+filmmaking, podcast, journalism). User called this out directly and asked for a real re-cull.
+Re-confirmed the real repo's category breakdown first rather than trusting the old audit's counts:
+394 was stale even before this pass (upstream additions since 2026-07-27 pushed several categories
+higher than previously recorded — `magazine-journalism` 38→43, `editing` 14→17 — real numbers used
+throughout below, not the stale ones).
+
+**Method**: 21 categories sorted into three buckets before any file-level work —
+(1) 8 categories cut **wholesale**, no file review, because the category itself is a
+promotional/distribution/localization function rather than filmmaking/podcast/journalism craft;
+(2) 8 categories kept **wholesale**, no file review, because the category is unambiguously in
+scope; (3) the remaining categories required **real file-by-file reading** — not a keyword sweep,
+actually opening each file's "When To Use This Skill" section and judging its stated scope against
+the criterion. A 5th category, `production-support` (16 files), was missing from the user's
+original 3-bucket breakdown entirely — not called out as keep, cut, or review. Flagged to the user
+rather than silently guessed at; treated as a 4th file-by-file review category using the same
+criterion, on the reasoning that an unclassified category defaults to the more rigorous path, not
+the less rigorous one.
+
+**Wholesale cut (8 categories, 83 files)**: `newsletter` (13), `pr-communications` (13),
+`social-media` (11), `image-prompting` (10), `translation` (7), `translation-localization` (4),
+`audience-distribution` (7), `youtube` (18). Removed as directories via `git rm -r`.
+
+**Wholesale keep (8 categories, 138 files)**: `tv-documentary` (27), `magazine-journalism` (43),
+`data-journalism` (18), `podcast` (12), `radio-audio` (12), `screenwriting` (9),
+`pre-production` (10), `archive-legal` (7).
+
+**File-by-file review (5 categories, 181 files → 164 kept / 17 cut)**. Read every file's
+frontmatter `description` plus its "When To Use This Skill" bullets (full text for the two most
+structurally ambiguous-sounding files, to confirm the shorter read was reliable before trusting it
+at scale) — the recurring finding, consistent with the 2026-07-26 Roles-narrowing session's own
+conclusion about this source package, was that folder/file names that *sound* generic
+(`locations-logistics`, `media-competitive`, `production-support/formatting`) routinely turned out
+to be genuinely journalism/documentary-specific once actually read, while a handful of files whose
+names sound media-adjacent turned out to be platform-promotional or general-business content once
+read closely. Both directions of surprise happened in this pass, which is the actual point of
+reading instead of pattern-matching on names:
+
+- **Research (73 kept / 0 cut)**: every subdirectory, including the two the user's own directive
+  flagged as likely needing cuts, held up under a full read. `locations-logistics` (8 files:
+  `shoot-equipment-list`, `filming-conditions-brief`, `location-permit-brief`, etc.) is real
+  documentary field-production logistics (crew equipment lists, filming permits, location scouting
+  for a shoot) — not generic business logistics despite the folder name. `media-competitive`
+  (6 files: `competitor-framing-analyzer`, `coverage-gap-identifier`, etc.) is newsroom competitive
+  analysis — reading how *other outlets* framed a story to find an underreported angle — not
+  generic corporate competitor analysis. Every other subdirectory (`academic`, `background`,
+  `data-statistics`, `fact-checking`, `facts-context`, `logistics`, `media`, `people`/
+  `people-contacts`, `preservation`, `scientific-academic`) is explicitly framed around "so a
+  journalist can report" throughout. Kept all 73.
+- **Writing (42 kept / 15 cut)**: `articles` (23) and `broadcast` (11) kept in full — core news/
+  feature writing and broadcast/podcast scripting, exactly the user's own "keep" call. `digital-social`
+  (13 files: Facebook/Instagram/LinkedIn/Twitter posts, YouTube titles/descriptions/chapters,
+  newsletter blurbs/subject lines, SEO headline variants, thumbnail text) cut **in full** — these
+  are platform-promotional micro-copy tools for the exact platforms/categories already cut wholesale
+  above (social media, YouTube, newsletter, SEO), just filed under `writing` instead. `institutional`
+  (10 files) split: kept `editorial-decision-memo-writer`, `festival-entry-synopsis-writer`,
+  `journalism-grant-application-writer`, `management-briefing-writer` (explicitly "newsroom or
+  production" framed once read in full, not generic corporate memo despite the name),
+  `post-interview-thankyou-writer` (explicitly about journalism source relationships, not generic
+  business courtesy), `production-status-update-writer` (explicitly commissioner/broadcaster/funder
+  framed), `source-followup-email-writer`, `source-pitch-email-writer` — cut `media-advisory-writer`
+  (a PR tool for *alerting* journalists to an event — the other side of the relationship this app's
+  users are on, same function as the already-cut `pr-communications` category) and
+  `speaker-notes-writer` (generic conference/slide-deck speaking notes, no documentary/journalism
+  framing anywhere in the file).
+- **Media Business (18 kept / 0 cut)**: `distribution`, `funding`, `legal`, `pitching` — every file
+  explicitly names a documentary/media-industry mechanism (festival strategy, broadcaster/streaming
+  pitch, arts-council or public-broadcaster grant narrative, footage/music rights clearance, talent
+  release forms, co-production proposals). None read as generic corporate biz-dev; this category is
+  about how *media projects specifically* get made, funded, and distributed, not general business
+  formation. Kept all 18.
+- **Editing (17 kept / 0 cut)**: every file's "When To Use" bullets name reporters, subeditors,
+  newsrooms, commissioning editors, broadcast scripts, or documentary commentary, even the ones
+  whose one-line description reads generically (`copy-editor`, `proofreader`, `project-memory`,
+  `project-retrospective`, `tone-consistency-checker`) — none of their own worked examples are
+  non-media (project-memory's list is entirely magazine/podcast/documentary/newsletter/YouTube-
+  channel projects; project-retrospective's is entirely series/season/pilot). `translation-accuracy-
+  reviewer` kept deliberately despite the wholesale `translation`/`translation-localization`
+  category cuts above — it verifies the accuracy of a journalist's *own* translated quotes/testimony
+  before publication (court testimony, diplomatic statements), a fact-checking/editorial-integrity
+  function, not the translation-*production*/localization-for-distribution function those two cut
+  categories covered. Kept all 17.
+- **Production Support (14 kept / 2 cut)** — the unlisted 5th category. Read closely because
+  several file *names* sounded like pure office/CMS utilities: all but two turned out to be
+  publication-production craft specifically (`footnotes-formatter`, `contributor-credits-writer`,
+  `style-guide-formatter` naming AP/Chicago — the actual news-writing style standards —
+  `transcript-qa-formatter` cleaning a raw interview transcript for publication, `format-converter-
+  brief`/`print-web-reformatter`/`web-section-splitter`/`web-section-breaker`/`table-of-contents-
+  writer`/`layout-placement-advisor`/`manuscript-formatter`/`author-bio-writer`/`asset-description-
+  writer` all framed around a "web editor," "print sub-editor," "editorial supplement," or "digital
+  producer" moving an *article* through a real publishing production pipeline). Cut
+  `cms-metadata-writer` (SEO/search-discoverability optimization — the same concern as the cut
+  `image-prompting`/social/SEO-adjacent categories, just wearing a CMS hat) and `teaser-block-writer`
+  (explicitly "newsletter" and "promotional teaser cards," matching the cut `newsletter` category's
+  own function).
+
+**Before/after count**: 402 → **302** autopunk files (**100 removed**, ~25%) — a real, substantial
+cut, unlike the prior pass's zero. Total bundled `.md` (autopunk + `filmcraft.md` +
+`THIRD_PARTY_LICENSES.md`): 404 → 304. `RolePickerButton`'s role count (excludes
+`THIRD_PARTY_LICENSES.md`, which has no frontmatter and is skipped by `RoleLibrary.loadAll()`):
+403 → **303** (302 autopunk + `filmcraft`, always counted as its own role).
+
+**No code changes needed** — same reasoning as the 2026-07-27 pass: `RoleLibrary.loadAll()` walks
+`Skills/` with a plain `FileManager.enumerator` and derives category/subcategory from each
+surviving file's own frontmatter and folder position, so removing files needed no picker-logic
+changes.
+
+**Real GUI verification** (signed `build/Audium.app`, rebuilt after the cull —
+`build.sh`'s Skills-bundling step confirmed 304 `.md` files under
+`Contents/Resources/Skills`): opened the role picker popover — placeholder correctly reads "Search
+303 roles…"; category sections render correctly (`Archive Legal`'s 7 roles listed alphabetically,
+`Data Journalism`'s subcategory labels — `Analysis`, `Visualization` — rendering under the
+appropriate role names). Searching "youtube" correctly returns "No matching roles" (confirms the
+wholesale-cut category and its `writing/digital-social` counterparts are actually gone, not just
+hidden). Searching "translation" correctly returns exactly one result — `Translation Accuracy
+Reviewer` under the `Editing` category header — confirming both the wholesale category removal and
+the single deliberate keep-within-a-cut-category decision are both reflected correctly in the live
+picker, not just on disk.
+
 ### Batch/folder transcription — implemented (2026-07-27)
 
 The next roadmap item after Parakeet's removal (§9). Lets a user select a whole folder of source
@@ -1370,6 +1502,66 @@ pass) and confirmed, end to end:
   `System Events` clicks in this pass specifically, unlike other confirmation dialogs earlier in
   this project's testing history; not investigated further since a human deleting test data via the
   UI works fine and this was just cleanup, not the feature under test).
+
+### Global speaker rename — implemented (2026-07-28)
+
+Interrupted mid-session previously (force-quit); resumed, verified the code was actually complete
+and compiling clean (it was — no partial edit), then took it through the real GUI test this
+project's testing discipline requires before marking anything done.
+
+**Behavior**: editing a segment's speaker label now renames every segment currently sharing that
+label, not just the one being edited — matches how diarization (SpeakerKit) actually assigns
+labels (one per detected voice across the whole transcript), so a correction should follow the
+same grouping. `ContentView.renameSpeaker(from:to:)` updates the working `segments` copy directly
+(covers a standalone/no-project file too) and, when a project Daily is loaded, calls the new
+`ProjectController.renameSpeaker(from:to:in:)` — same find-Daily-then-mutate-then-`save()` shape as
+every other `ProjectController` mutator. `SegmentRow.commitSpeakerEdit()` only fires the global
+rename when the edit changed an *existing* (non-empty) label to a different value — assigning a
+label to a previously-unlabeled segment has no group to rename and stays a single-segment edit via
+the live binding already in place.
+
+**Real GUI test** (signed `build/Audium.app`): needed a real multi-speaker SpeakerKit-diarized
+transcript, and the existing smoke-test project from prior sessions was gone (that session's
+scratchpad had been cleaned up between sessions), so a fresh one was built. Synthesized a ~46s
+two-voice interview clip with macOS `say` (`Daniel`, en_GB male; `Samantha`, en_US female;
+alternating turns, concatenated with `ffmpeg`) as real audio to feed the real pipeline, seeded a
+project folder + Daily pointing at it directly on disk (the add-Daily flow needs `NSOpenPanel`,
+not synthetically automatable — same precedent as every prior real-GUI-test session), then drove
+the actual "Re-transcribe" button in the running app: real `whisper.cpp` transcription + real
+`SpeakerKit` diarization, not fabricated segment data. First attempt (a shorter ~19s clip, 2-4s
+turns) collapsed both voices into a single `Speaker 0` — SpeakerKit's clustering didn't find enough
+per-turn evidence to split. A longer clip (~7-8s turns, ~46s total) produced genuine separation:
+3 distinct real labels (`Speaker 0`/`1`/`2`, imperfectly matching the true 2-speaker ground truth in
+one turn, which is realistic real-world diarizer noise, not a seeded/idealized result). Renamed the
+3-segment `Speaker 2` group to "Interviewee" via the actual speaker-label button in the transcript
+list: all 3 segments (00:22/00:31/00:39) updated together, live in the UI and in the on-disk
+`.audiumproject.json`, while `Speaker 0` (00:00/00:14) and `Speaker 1` (00:07) segments were
+untouched. Fully quit → relaunched → reopened the project → reselected the Daily: all 6 rows
+matched exactly, confirming full round-trip persistence.
+
+**Investigated but not pursued for this test**: `PyannoteDiarizationOptions(numberOfSpeakers: 2)`
+exists in the `SpeakerKit` package and would force exactly 2 clusters instead of auto-detecting, but
+`SpeakerDiarizer.swift` never passes it today. Left as-is rather than changed — forcing a fixed
+speaker count is a real behavior change to diarization for every future transcription, out of scope
+for a rename-feature test and worth a deliberate decision on its own, not a quiet fix bundled in
+here. Noted as a possible future refinement, not built.
+
+**New AX-automation lessons this session** (adds to the existing per-control-reliability notes
+below): (1) a plain-looking icon button's `help` attribute (System Events' `help of <button>`,
+distinct from `name`/`description`, which stayed `missing value` throughout) revealed real,
+distinguishing text (`"Remove highlight"`) where positional-index guessing kept landing on the
+wrong control in a 4-button transcript row (timestamp/star/speaker/edit-pencil, in that source
+declaration order) — worth checking before further positional guessing next time an icon-only
+row has several ambiguous buttons at similar coordinates. (2) Entering a row's inline edit mode
+(speaker or transcript-text) inserts a `Done`/`Cancel` button pair into that row, shifting every
+subsequent button's index in the same scroll area — re-fetch button indices fresh after toggling
+any edit mode, don't reuse indices captured before it. (3) Plain `keystroke`/`key code` System
+Events commands go to whatever the OS considers frontmost at the *keyboard* level, which can
+silently diverge from the app most recently `click`-ed via AXPress (in this session, keystrokes
+meant for a just-opened Audium `TextField` landed in a completely different app's chat input
+instead, with no error) — setting `value of <text field>` directly plus `perform action
+"AXConfirm"` avoided the whole class of misdirected-keystroke risk and is the safer default for
+any future scripted text entry.
 
 ### AI Chat header overflow bug — fixed (2026-07-23)
 
