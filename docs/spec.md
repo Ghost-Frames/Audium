@@ -1848,6 +1848,175 @@ signed app, not just code review — including the empirical `lsof` check for st
 stronger evidence than a visual-only check would have been (a paused-but-still-loaded player would
 look identical on screen to a fully torn-down one).
 
+### Word-level timestamps + arbitrary text-selection highlighting + inline "Add to Paper Edit" — implemented (2026-07-28)
+
+Three-stage change, real-GUI-tested on Zeus and reviewed via the doubt-driven-development
+adversarial-review practice (2026-07-26 standing practice) before being marked done.
+
+**Stage 1 — word-level timestamps**. `TranscriptWord` (`TranscriptionProvider.swift`): `text`/
+`start`/`end`, `TimeInterval`, always the same absolute whole-file timeline as
+`TranscriptSegment.start`/`end` (not segment-relative) — confirmed for all three providers, not
+assumed:
+- **WhisperKit**: `DecodingOptions(wordTimestamps: true)` (default `false`, confirmed in
+  WhisperKit's own `Configurations.swift` — off by default because it costs an extra decode pass)
+  passed to `pipe.transcribe(audioPath:decodeOptions:callback:)`; maps `TranscriptionSegment.words`
+  (`[WhisperKit.WordTiming]`, already `Float` seconds) straight across.
+- **whisper.cpp**: upgraded from `-oj` (plain JSON) to `-ojf -sow` (`--output-json-full`
+  `--split-on-word`) — confirmed against whisper.cpp's own `examples/cli/cli.cpp`
+  `output_json` function directly (not assumed, per the 2026-07-27 standing practice for
+  third-party CLI tools): `-sow` merges sub-word BPE tokens onto word boundaries before `-ojf`
+  writes each segment's `tokens` array, so it becomes real per-word timing. Offsets are
+  milliseconds, divided by 1000 to seconds at the parse boundary. Two real bugs found via live
+  testing on the actual bundled binary, not assumed from reading the source:
+  1. Every segment's first "word" came back as `[_BEG_]` (and other whisper.cpp internal special
+     tokens the same shape) — cli.cpp writes these into the same `tokens` array as real words.
+     Filtered by matching `[_...]` specifically (whisper.cpp's own vocab names every special token
+     with a leading underscore inside the brackets) rather than any bracket-wrapped text — this
+     bundled model's own sound annotations use parens, not brackets (confirmed live: a real decode
+     produced `"(eerie music)"`), but a broader `[...]` match would still wrongly strip a
+     legitimate bracketed annotation from another model/language (caught via adversarial review).
+  2. `SpeakerDiarizer.labelSpeakers` — shared by all three providers, runs after transcription to
+     merge in speaker labels — rebuilds every `TranscriptSegment` via
+     `TranscriptSegment(text:start:end:speaker:)` without passing `words:`, silently defaulting it
+     to `nil` and dropping every word-level timing this whole stage exists to produce. This is the
+     kind of bug real GUI testing exists to catch: `swift build` and a code read both looked
+     correct: `words` was populated correctly by `WhisperCppProvider`/`WhisperKitProvider` right
+     up until it passed through the shared diarization step immediately afterward. Only caught by
+     actually re-transcribing a real file, saving, and reading the persisted `words` field back
+     off disk — it was reliably `null` for a fully working per-provider parse. Fixed by forwarding
+     `words: segment.words` in `SpeakerDiarizer`'s rebuild.
+- **OpenAI (whisper-1)**: added `timestamp_granularities[]=segment` and `=word` multipart fields
+  (both, not `word` alone — untested whether `word` alone still returns `segments`, and this
+  parser already depends on that array) to the existing `verbose_json` request. Per OpenAI's own
+  documented example response shape (real web search, not assumed): word timing lives in a
+  **top-level** `words` array, a sibling of `segments`, not nested inside each segment — paired
+  back to its containing segment here by time-range overlap with a 50ms epsilon (float-rounding
+  tolerance). Known minor edge case, not fixed: a word straddling a segment boundary by more than
+  50ms could fall outside both segments' epsilon windows and silently drop from any segment's
+  `words` (not from `segment.text`, which comes from the API independently) — accepted as a rare,
+  low-impact gap rather than added reconciliation complexity for a third-party API quirk.
+- **Gemini**: unchanged, `words` stays `nil` — Gemini's `generateContent` has no internal timestamp
+  structure at all (already documented before this change), so it can only ever produce one
+  whole-transcript segment. Every consumer of `.words` must treat `nil` as "fall back to
+  segment-level" — never force-unwrapped anywhere in this stage.
+- `Transcript.text(from:to:)` (`TranscriptionProvider.swift`) resolves a `start`/`end` range back
+  to spoken text — word-precise (only the words actually overlapping the range) when the touched
+  segment has `words`, else that segment's whole `text`. Its word-rejoining logic
+  (`joinWords`) had to special-case punctuation-only tokens and apostrophe-led contraction
+  continuations (whisper.cpp's `-sow` splits `I'm` into `I` + `'m` as two separate word tokens,
+  confirmed via real output) to avoid `"silence , Can you"` / `"I 'm"` — both caught via real GUI
+  testing (a Highlight's preview text over a segment that had just gained word data), not assumed.
+
+**Stage 2 — arbitrary cross-segment text selection**. Plain SwiftUI `Text` has no API to report a
+selected character range across sibling views, so the whole transcript now renders as **one
+`NSTextView`** (`TranscriptFlowView.swift`, new file) — the same "drop to AppKit when SwiftUI's own
+capability is insufficient" precedent as `PlayerView`/`AVPlayerView` replacing `VideoPlayer` (spec
+§8, Video playback). Each segment becomes one paragraph: a `"[mm:ss] Speaker: "` prefix (dimmed,
+non-selectable-as-a-unit) followed by the segment's spoken text; word-level `FlowUnit`s (character
+ranges in the shared `NSTextStorage`, found via sequential substring search within that segment's
+own text) back word-precise selection where `words` exists, one whole-segment `FlowUnit` otherwise
+— the same graceful-degradation rule as `Transcript.text(from:to:)`. `Highlight.start`/`.end` (
+`Project.swift`) needed **no schema change** for this — it was already a generic `TimeInterval`
+pair (single-segment was a behavioral convention from the star-button toggle, not a stored
+constraint), so an arbitrary range is just a narrower or wider value than before; every pre-Stage-2
+Highlight on disk still decodes and displays correctly unchanged.
+
+**Deliberate scope trade-off**: the old inline "double-click to edit text/speaker in place"
+affordance (`SegmentRow`'s `TextField` swap) doesn't survive one shared `NSTextView` — there's no
+per-segment `Binding<TranscriptSegment>` anymore. Double-click now opens a small `EditSegmentPopover`
+(anchored to the whole Transcript panel, not the exact click point — there's no per-segment anchor
+view left) calling the same `onRenameSpeaker` plumbing as before for speaker changes. A hand text
+edit now also clears that segment's `words` (`ContentView.swift`) — leaving it in place risked
+`TranscriptFlowView`'s substring-search word-matching silently reattaching a stale pre-edit
+timestamp to an unrelated word in the edited text that happens to share the same string (e.g.
+common short words like "the"/"you") instead of safely falling back to whole-segment; caught via
+adversarial review, not live.
+
+Two places resolve a Highlight back to display text by looking up a segment — both still assumed
+`segment.start == highlight.start` exactly (true only for the old whole-segment-only model) and
+had to be fixed to use `Transcript.text(from:to:)` instead, confirmed via real GUI testing (the
+first attempt showed literal `"(segment not found)"` for a sub-segment Highlight): `ContentView.swift`'s
+`HighlightsListView.segmentText(for:)`, and `PaperEditView.swift`'s `PaperEditEntriesView.resolved`
+(also feeds the DOCX/`ResolvedEntry.text` export path, so the fix propagates there for free).
+
+**Stage 3 — floating "Add Highlight" / "Add to Paper Edit" + right-click fallback**
+(`TranscriptPanel`/`SelectionActionBar` in `ContentView.swift`). A selection with non-zero length
+shows a small `GlassPanel`-styled pill just above it (positioned via `NSLayoutManager
+.boundingRect(forGlyphRange:in:)`, adjusted for `textContainerInset` and current scroll offset) —
+"Add Highlight" (`AccentButtonStyle`) plus "Add to Paper Edit" (a `Menu` styled as one pill, listing
+existing Paper Edits + "New Paper Edit…", same disambiguation `HighlightsListView`'s existing
+per-highlight menu already needed since a project can hold several Paper Edits). Both clear the
+selection and dismiss the bar on success — via a `clearSelectionRequest` binding that commands the
+underlying `NSTextView.setSelectedRange` directly, since the SwiftUI-side state going `nil` alone
+hides the bar but doesn't touch AppKit's own native blue selection highlight. Right-click (`FlowTextView
+.menu(for:)`) offers the same two actions as a secondary path when a selection exists, gated on
+`canHighlight` (nil `dailyID`, i.e. a standalone/no-project file, hides it entirely rather than
+showing a dead action) — reviewed but not independently confirmed via a live right-click GUI test
+this session (two attempts via `cliclick`'s synthetic right-click didn't visibly produce the native
+context menu; the primary floating-button path, which shares the exact same underlying action
+closures, was confirmed working repeatedly).
+
+**Real GUI test** (signed `build/Audium.app`, same "Audium Smoke Test Project" reused across prior
+phases at `/Users/zeus/Developer/TestFiles/New Project`): re-transcribed a real linked `.wav`
+(`Fontaines DC - Can You Feel My Heart`, 3:47, whisper.cpp `base.en`) — confirmed `words` genuinely
+persisted per-segment on disk only *after* the `SpeakerDiarizer` fix above (the exact bug this
+stage's testing caught). Dragged a real cross-word, mid-sentence selection ("the hopeless, But
+begging on") via `cliclick`; floating bar appeared positioned correctly; "Add Highlight" persisted
+`start: 59.62, end: 64.77` against that segment's own `57.76–70.56` — genuinely sub-segment,
+word-precise, not the whole segment. Repeated with "Add to Paper Edit → New Paper Edit…": created
+`Highlight` + `PaperEdit` + `PaperEditEntry` correctly linked; Story Editor's entry list resolved
+the correct word-precise text (not "(segment not found)"); clicking the entry's play button opened
+the Daily's tab and sought/played from the right timestamp, with the currently-playing segment
+underlined in the Transcript panel — full playback path confirmed working end-to-end. Repeated
+against a word-less (segment-only, same shape Gemini produces) test Daily: selecting a
+mid-segment partial phrase ("two short sentences") and adding a Highlight persisted `start: 3, end:
+6` — the segment's *whole* range, not the substring — confirming Stage 2's graceful fallback for
+Gemini-style transcripts. Existing highlight list/management UI (star-count badge, `HighlightsListView`
+popover) kept working against the new sub-segment model without further changes beyond the
+`segmentText(for:)` fix above.
+
+**Adversarial review** (doubt-driven-development, fresh subagent, CLAIM withheld per the skill's
+own rule) surfaced 6 findings against a diff-only artifact; 4 were real and fixed, 1 was real but
+accepted as a documented trade-off, 1 was checked and found not to apply to this specific bundled
+model:
+- A selection boundary landing in a segment's `"[mm:ss] Speaker: "` prefix or the `"\n\n"`
+  separator (neither belongs to any `FlowUnit`) fell back to the *previous* segment's last word
+  instead of the correct segment's own first word — a backwards-fallback-direction bug, not caught
+  live because dragging into the middle of a sentence (the natural way to select a phrase) never
+  starts inside a prefix. Fixed by making the start-boundary fallback search forward and the
+  end-boundary fallback search backward (symmetric with what each direction should mean at a gap).
+- `clearSelectionRequest`'s programmatic-selection-clear could re-arm `suppressNextSelectionSeek`
+  on a redundant `updateNSView` call (very plausible in practice: the highlight-adding mutation that
+  sets `clearSelectionRequest` itself triggers another SwiftUI render pass before the `DispatchQueue
+  .main.async` reset lands) without ever getting consumed, since AppKit doesn't re-notify the
+  delegate for a `setSelectedRange` call that doesn't actually change anything — silently eating
+  the next real click-to-seek. Fixed by skipping the redundant clear entirely when the selection is
+  already empty.
+- Highlight background tint was painted per matched word unit rather than as one contiguous span,
+  leaving the inter-word spaces untinted — cosmetically negligible in practice (confirmed via the
+  real GUI test screenshots, which read as continuous) but trivially fixed to paint one merged
+  range per highlight instead.
+- (Already covered above under Stage 1/2: the `[_...]` special-token filter tightened from any
+  bracket-wrapped text, and the hand-edit-clears-`words` fix.)
+- **Accepted trade-off, not fixed**: OpenAI's word/segment epsilon-pairing gap (documented above).
+- **Checked, doesn't apply**: the reviewer's concern that a broader `[...]` filter would strip
+  legitimate bracketed sound annotations was real in principle, but this bundled whisper.cpp model's
+  own annotations use parens (`"(eerie music)"`, confirmed live) — resolved by tightening the match
+  to `[_...]` rather than leaving the broader match in place.
+
+**Known remaining gap, not resolved this session**: while re-verifying the adversarial-review fixes
+live, a cross-word selection that happened to *start* inside a segment's `[mm:ss] Speaker:` prefix
+region did not show the floating action bar at all (as opposed to the wrong-anchor bug above, which
+*did* show a bar, just with a wrong range) — real accessibility-text confirmed a genuine non-empty
+NSTextView selection existed at the time. Not conclusively root-caused: most of this session's
+apparent "the Add Highlight button doesn't respond" incidents turned out to be a testing-methodology
+artifact (this app's Waveform-panel "Re-transcribe" link and the Transcript-panel floating bar's
+"Add Highlight" button coincidentally sit at nearly the same x-coordinate in different panels,
+causing repeated mis-clicks during this session's `cliclick`/AXPress testing — not a real button
+failure), and this specific case may be the same artifact rather than a genuine rendering bug.
+Flagged honestly rather than claimed fixed; worth a focused human-at-the-mouse re-check in a future
+session before considering Stage 3 fully closed on this specific edge case.
+
 ### AI Chat header overflow bug — fixed (2026-07-23)
 
 Adding the role picker (above) to `AIChatPanel`'s header row made "AI Chat" render as a

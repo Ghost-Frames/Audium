@@ -155,9 +155,9 @@ struct ContentView: View {
                                     highlights: currentHighlights,
                                     paperEdits: project.metadata?.paperEdits ?? [],
                                     dailyID: currentDailyID,
-                                    onToggleHighlight: toggleHighlight,
                                     onRemoveHighlight: removeHighlight,
                                     onAddToPaperEdit: addToPaperEdit,
+                                    onAddHighlightFromSelection: addHighlightFromSelection,
                                     onRenameSpeaker: renameSpeaker,
                                     batchProgress: batchProgressText
                                 )
@@ -449,18 +449,17 @@ struct ContentView: View {
         return []
     }
 
-    /// Marks/unmarks a single segment as a Highlight (spec §8: per-segment marking, the simpler
-    /// of the two selection mechanisms considered — cross-segment ranges are a later follow-up).
-    /// Toggled by matching `start` against any existing highlight for this segment; segments can
-    /// share duplicate text but not duplicate start times within one transcript, so `start` alone
-    /// is a safe identity check here (same reasoning as `Highlight`'s own doc comment).
-    private func toggleHighlight(for segment: TranscriptSegment) {
-        guard let currentDailyID else { return }
-        if let existing = currentHighlights.first(where: { $0.start == segment.start }) {
-            project.removeHighlight(existing.id, from: currentDailyID)
-        } else {
-            project.addHighlight(Highlight(id: UUID(), start: segment.start, end: segment.end, note: nil, createdAt: Date()), to: currentDailyID)
-        }
+    /// Creates a Highlight from an arbitrary text-selection range (spec §8 Stage 2/3 — supersedes
+    /// the old per-segment star-button toggle). `range.start`/`range.end` are already word-precise
+    /// where the transcript has word-level timing, or clamped to whole segment(s) where it
+    /// doesn't (`TranscriptFlowView`'s selection-resolution logic) — this just persists whatever
+    /// range it's handed, same as the old toggle persisted a whole segment's `start`/`end`.
+    @discardableResult
+    private func addHighlightFromSelection(_ range: TranscriptSelectionRange) -> Highlight? {
+        guard let currentDailyID else { return nil }
+        let highlight = Highlight(id: UUID(), start: range.start, end: range.end, note: nil, createdAt: Date())
+        project.addHighlight(highlight, to: currentDailyID)
+        return highlight
     }
 
     private func removeHighlight(_ highlightID: UUID) {
@@ -1231,6 +1230,19 @@ private struct WaveformBarsView: View {
 }
 
 
+/// One segment currently being edited via the double-click popover (spec §8 Stage 2) — replaces
+/// the old inline `TextField` swap, since editing a single segment's text/speaker no longer has a
+/// per-segment `Binding<TranscriptSegment>` once the transcript renders as one shared
+/// `TranscriptFlowView` (see that file's doc comment for why). `index` into the current `segments`
+/// array — stable for the duration of one popover session (nothing else mutates segment order
+/// while it's open).
+private struct EditingSegment: Identifiable {
+    let index: Int
+    var text: String
+    var speaker: String
+    var id: Int { index }
+}
+
 private struct TranscriptPanel: View {
     @Binding var segments: [TranscriptSegment]
     let isTranscribing: Bool
@@ -1242,24 +1254,41 @@ private struct TranscriptPanel: View {
     let highlights: [Highlight]
     let paperEdits: [PaperEdit]
     /// nil for a standalone (no-project) file — highlights need a Daily to attach to, same
-    /// constraint as Re-transcribe's `dailyID`. Gates both the header's highlight count/list and
-    /// each row's highlight-toggle star.
+    /// constraint as Re-transcribe's `dailyID`. Gates the header's highlight count/list and
+    /// whether a text selection can produce a Highlight at all.
     let dailyID: UUID?
-    let onToggleHighlight: (TranscriptSegment) -> Void
     let onRemoveHighlight: (UUID) -> Void
     let onAddToPaperEdit: (Highlight, UUID?) -> Void
+    /// Creates a Highlight from a resolved selection range and returns it (spec §8 Stage 3) — used
+    /// by both the floating "Add Highlight" button and the right-click fallback menu.
+    let onAddHighlightFromSelection: (TranscriptSelectionRange) -> Highlight?
     /// Global speaker rename (spec §8) — `to == nil` clears the label. Applies to every segment
     /// currently sharing `from`, not just the one edited.
     let onRenameSpeaker: (_ from: String, _ to: String?) -> Void
     /// "File 3 of 12 — clip.mov" while a batch/folder ingest is running (spec §9); `nil` otherwise.
     let batchProgress: String?
 
-    /// Last segment whose start falls at or before the playhead — the one currently playing
-    /// (spec §2: "clickable transcript sync"). A linear scan over a few hundred segments at most,
-    /// re-run on every ~50ms playhead tick; no need for anything fancier.
-    private var currentSegmentID: TranscriptSegment.ID? {
-        guard playback.isLoaded else { return nil }
-        return segments.last { $0.start <= playback.currentTime }?.id
+    @State private var selectionRange: TranscriptSelectionRange?
+    @State private var selectionRect: CGRect?
+    @State private var clearSelectionRequest = false
+    @State private var editingSegment: EditingSegment?
+
+    private func clearSelection() {
+        selectionRange = nil
+        selectionRect = nil
+        clearSelectionRequest = true
+    }
+
+    private func addHighlightAndClear() {
+        guard let selectionRange else { return }
+        _ = onAddHighlightFromSelection(selectionRange)
+        clearSelection()
+    }
+
+    private func addToPaperEditAndClear(_ paperEditID: UUID?) {
+        guard let selectionRange, let highlight = onAddHighlightFromSelection(selectionRange) else { return }
+        onAddToPaperEdit(highlight, paperEditID)
+        clearSelection()
     }
 
     var body: some View {
@@ -1290,34 +1319,148 @@ private struct TranscriptPanel: View {
                     .foregroundStyle(status.hasPrefix("Transcription failed") ? .red : .secondary)
                 Spacer()
             } else {
-                let currentID = currentSegmentID
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 10) {
-                            ForEach($segments) { $segment in
-                                SegmentRow(
-                                    segment: $segment,
-                                    isCurrent: segment.id == currentID,
-                                    isHighlighted: highlights.contains { $0.start == segment.start },
-                                    canHighlight: dailyID != nil,
-                                    onSeek: { playback.seek(to: segment.start) },
-                                    onToggleHighlight: { onToggleHighlight(segment) },
-                                    onRenameSpeaker: onRenameSpeaker
-                                )
-                                .id(segment.id)
-                            }
-                        }
-                    }
-                    .onChange(of: currentID) { _, newValue in
-                        guard let newValue else { return }
-                        withAnimation { proxy.scrollTo(newValue, anchor: .center) }
+                ZStack(alignment: .topLeading) {
+                    TranscriptFlowView(
+                        segments: segments,
+                        highlights: highlights,
+                        currentTime: playback.isLoaded ? playback.currentTime : -1,
+                        onSeek: { playback.seek(to: $0) },
+                        onSelectionChange: { range, rect in
+                            selectionRange = range
+                            selectionRect = rect
+                        },
+                        onDoubleClickSegment: { index in
+                            guard segments.indices.contains(index) else { return }
+                            editingSegment = EditingSegment(index: index, text: segments[index].text, speaker: segments[index].speaker ?? "")
+                        },
+                        onRightClickAddHighlight: addHighlightAndClear,
+                        onRightClickAddToPaperEdit: addToPaperEditAndClear,
+                        paperEdits: paperEdits,
+                        canHighlight: dailyID != nil,
+                        clearSelectionRequest: $clearSelectionRequest
+                    )
+                    if dailyID != nil, let selectionRange, let selectionRect {
+                        SelectionActionBar(paperEdits: paperEdits, onAddHighlight: addHighlightAndClear, onAddToPaperEdit: addToPaperEditAndClear)
+                            .offset(x: selectionRect.minX, y: max(0, selectionRect.minY - 34))
+                            .transition(.opacity)
+                            .id(selectionRange)
                     }
                 }
+                .animation(.easeOut(duration: 0.12), value: selectionRange)
             }
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .glassPanel()
+        .popover(item: $editingSegment) { editing in
+            EditSegmentPopover(editing: editing, onSave: { text, speaker in
+                let index = editing.index
+                guard segments.indices.contains(index) else { return }
+                let previousSpeaker = segments[index].speaker
+                if segments[index].text != text {
+                    // A hand edit invalidates any existing word-level timing — `words` was
+                    // computed against the *old* text, and re-matching its word strings against
+                    // the *new* text via substring search (`TranscriptFlowView.rebuild`) could
+                    // silently reattach a stale timestamp to an unrelated word that happens to
+                    // share the same text (e.g. common short words like "the"/"you") rather than
+                    // safely falling back to whole-segment (caught via adversarial review, not
+                    // live) — clearing it forces that safe fallback instead of risking silently
+                    // wrong sub-segment timing after an edit.
+                    segments[index].words = nil
+                }
+                segments[index].text = text
+                let newSpeaker = speaker.isEmpty ? nil : speaker
+                segments[index].speaker = newSpeaker
+                if let previousSpeaker, !previousSpeaker.isEmpty, previousSpeaker != newSpeaker {
+                    onRenameSpeaker(previousSpeaker, newSpeaker)
+                }
+                editingSegment = nil
+            }, onCancel: { editingSegment = nil })
+        }
+    }
+}
+
+/// Floating "Add Highlight" / "Add to Paper Edit" pill (spec §8 Stage 3) — the primary interaction
+/// for turning a text selection into a Highlight, positioned just above the selection by
+/// `TranscriptPanel`. Disappears when the selection is cleared or an action succeeds (both drive
+/// `TranscriptPanel.selectionRange` back to nil), whichever happens first. "Add to Paper Edit" is
+/// a `Menu` styled as one pill button (not a separate right-click flow) — a real single action
+/// when there's exactly one Paper Edit to disambiguate isn't otherwise possible when several
+/// exist, same disambiguation `HighlightsListView`'s existing per-highlight menu already needed.
+private struct SelectionActionBar: View {
+    let paperEdits: [PaperEdit]
+    let onAddHighlight: () -> Void
+    let onAddToPaperEdit: (UUID?) -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Button("Add Highlight", action: onAddHighlight)
+                .buttonStyle(.accent)
+                .font(.caption.bold())
+            Menu {
+                ForEach(paperEdits) { paperEdit in
+                    Button(paperEdit.name) { onAddToPaperEdit(paperEdit.id) }
+                }
+                if !paperEdits.isEmpty { Divider() }
+                Button("New Paper Edit…") { onAddToPaperEdit(nil) }
+            } label: {
+                Label("Add to Paper Edit", systemImage: "film.stack")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .font(.caption.bold())
+            .foregroundStyle(Theme.accent)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Theme.background)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Theme.accent, lineWidth: 1))
+        }
+        .padding(6)
+        .glassPanel(cornerRadius: 12)
+        .fixedSize()
+        .shadow(radius: 6)
+    }
+}
+
+/// Anchored via `.popover(item:)` to the whole Transcript panel rather than the exact click point
+/// (spec §8 Stage 2's documented trade-off, `TranscriptFlowView`'s doc comment) — there's no
+/// per-segment anchor view left once the transcript is one shared `NSTextView`.
+private struct EditSegmentPopover: View {
+    let editing: EditingSegment
+    let onSave: (_ text: String, _ speaker: String) -> Void
+    let onCancel: () -> Void
+
+    @State private var text: String
+    @State private var speaker: String
+
+    init(editing: EditingSegment, onSave: @escaping (_ text: String, _ speaker: String) -> Void, onCancel: @escaping () -> Void) {
+        self.editing = editing
+        self.onSave = onSave
+        self.onCancel = onCancel
+        _text = State(initialValue: editing.text)
+        _speaker = State(initialValue: editing.speaker)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Edit Segment").font(.headline)
+            TextField("Speaker", text: $speaker)
+                .textFieldStyle(.roundedBorder)
+            TextField("Text", text: $text, axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(2...8)
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                Button("Done") { onSave(text, speaker) }
+                    .buttonStyle(.accent)
+            }
+        }
+        .padding()
+        .frame(width: 320)
     }
 }
 
@@ -1368,186 +1511,6 @@ private struct TranscriptionProgressView: View {
                         }
                     }
                 }
-            }
-        }
-    }
-}
-
-/// One transcript segment, editable in place (spec §2: "Transcript editing (inline
-/// correction..."). Text and speaker are independently click-to-edit — a real Button (not just
-/// a bare tap gesture) so the affordance is keyboard/accessibility-reachable, plus double-click
-/// on the text itself as a shortcut — since they're logically separate corrections (a
-/// mistranscription vs. a diarization mislabel). Timestamps are read-only (spec §5, resolved:
-/// text-only editing for v1, no word-level resync).
-///
-/// Enter/losing focus commits (the field writes straight through the binding as you type, so
-/// "commit" is really just leaving edit mode); Escape reverts to a snapshot taken when editing
-/// started. No undo/redo beyond that single revert — out of scope for this pass, flagged as a
-/// possible future addition rather than built now.
-private struct SegmentRow: View {
-    @Binding var segment: TranscriptSegment
-    /// True while this is the segment under the playhead (spec §2, clickable transcript sync).
-    let isCurrent: Bool
-    /// True if a Highlight exists anchored to this segment (spec §8). Deliberately a *different*
-    /// visual treatment from `isCurrent` (a leading accent stripe, not another full-row tint) so
-    /// the two states read distinctly even when both are true at once — a highlighted segment
-    /// that also happens to be under the playhead shouldn't look like generic "extra-accented".
-    let isHighlighted: Bool
-    /// False for a standalone (no-project) file — there's no Daily to persist a highlight to, so
-    /// the star is shown but disabled/dimmed rather than hidden (keeps row layout stable when
-    /// opening/closing a project while a file is loaded).
-    let canHighlight: Bool
-    let onSeek: () -> Void
-    let onToggleHighlight: () -> Void
-    /// Global speaker rename (spec §8) — see `TranscriptPanel`'s doc comment. Only fired when
-    /// editing changes an *existing* (non-empty) speaker label; assigning a label to a
-    /// previously-unlabeled segment has no group to rename and stays a single-segment edit.
-    let onRenameSpeaker: (_ from: String, _ to: String?) -> Void
-
-    @State private var isEditingText = false
-    @State private var isEditingSpeaker = false
-    @State private var textSnapshot = ""
-    @State private var speakerSnapshot = ""
-    @FocusState private var textFieldFocused: Bool
-    @FocusState private var speakerFieldFocused: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Button(formatTime(segment.start)) { onSeek() }
-                    .buttonStyle(.plain)
-                    .font(.caption.bold())
-                    .foregroundStyle(Theme.accent)
-                speakerField
-                Spacer()
-                Button { onToggleHighlight() } label: {
-                    Image(systemName: isHighlighted ? "star.fill" : "star")
-                        .font(.caption)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(isHighlighted ? Theme.accent : Theme.accent.opacity(0.4))
-                .disabled(!canHighlight)
-                .help(canHighlight ? (isHighlighted ? "Remove highlight" : "Mark as highlight") : "Open within a project to mark highlights")
-            }
-            textField
-        }
-        .padding(6)
-        .padding(.leading, isHighlighted ? 4 : 0)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(isCurrent ? Theme.accent.opacity(0.14) : .clear)
-        )
-        .overlay(alignment: .leading) {
-            if isHighlighted {
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(Theme.accent)
-                    .frame(width: 3)
-                    .padding(.vertical, 2)
-            }
-        }
-        .contentShape(Rectangle())
-        .onTapGesture { onSeek() }
-    }
-
-    private func enterTextEdit() {
-        textSnapshot = segment.text
-        isEditingText = true
-    }
-
-    private func enterSpeakerEdit() {
-        speakerSnapshot = segment.speaker ?? ""
-        if segment.speaker == nil { segment.speaker = "" }
-        isEditingSpeaker = true
-    }
-
-    /// Fires the global rename only when the edit changed an *existing* label (`speakerSnapshot`
-    /// non-empty) to a different value — matches diarization's grouping (spec §8). Assigning a
-    /// label to a previously-unlabeled segment (`speakerSnapshot` empty) has no group to rename;
-    /// the live binding on the TextField below already applied that as a single-segment edit.
-    private func commitSpeakerEdit() {
-        let finalValue = segment.speaker ?? ""
-        guard finalValue != speakerSnapshot, !speakerSnapshot.isEmpty else { return }
-        onRenameSpeaker(speakerSnapshot, finalValue.isEmpty ? nil : finalValue)
-        speakerSnapshot = finalValue
-    }
-
-    @ViewBuilder
-    private var speakerField: some View {
-        if isEditingSpeaker {
-            TextField("Speaker", text: Binding(
-                get: { segment.speaker ?? "" },
-                set: { segment.speaker = $0 }
-            ))
-            .textFieldStyle(.plain)
-            .font(.caption.bold())
-            .foregroundStyle(Theme.accent)
-            .frame(width: 110)
-            .focused($speakerFieldFocused)
-            .onAppear { speakerFieldFocused = true }
-            .onSubmit {
-                commitSpeakerEdit()
-                isEditingSpeaker = false
-            }
-            .onExitCommand {
-                segment.speaker = speakerSnapshot.isEmpty ? nil : speakerSnapshot
-                isEditingSpeaker = false
-            }
-            .onChange(of: speakerFieldFocused) { _, focused in
-                if !focused {
-                    commitSpeakerEdit()
-                    isEditingSpeaker = false
-                }
-            }
-        } else {
-            Button(segment.speaker ?? "+ speaker") { enterSpeakerEdit() }
-                .buttonStyle(.plain)
-                .font(segment.speaker == nil ? .caption : .caption.bold())
-                .foregroundStyle(segment.speaker == nil ? .secondary : Theme.accent)
-        }
-    }
-
-    @ViewBuilder
-    private var textField: some View {
-        if isEditingText {
-            VStack(alignment: .leading, spacing: 4) {
-                TextField("Segment text", text: $segment.text, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...6)
-                    .padding(6)
-                    .glassPanel(cornerRadius: 8)
-                    .focused($textFieldFocused)
-                    .onAppear { textFieldFocused = true }
-                    .onSubmit { isEditingText = false }
-                    .onExitCommand {
-                        segment.text = textSnapshot
-                        isEditingText = false
-                    }
-                    .onChange(of: textFieldFocused) { _, focused in
-                        if !focused { isEditingText = false }
-                    }
-                HStack(spacing: 6) {
-                    Button("Done") { isEditingText = false }
-                        .font(.caption.bold())
-                        .buttonStyle(.accent)
-                    Button("Cancel") {
-                        segment.text = textSnapshot
-                        isEditingText = false
-                    }
-                    .buttonStyle(.plain)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-            }
-        } else {
-            HStack(alignment: .top, spacing: 6) {
-                Text(segment.text)
-                    .onTapGesture(count: 2) { enterTextEdit() }
-                Button { enterTextEdit() } label: {
-                    Image(systemName: "pencil")
-                        .font(.caption)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(Theme.accent.opacity(0.7))
             }
         }
     }
@@ -1655,8 +1618,13 @@ private struct HighlightsListView: View {
         .frame(width: 300)
     }
 
+    /// Spec §8 Stage 2 — a Highlight's range no longer necessarily matches one whole segment's
+    /// `start`/`end` exactly (arbitrary text selection), so this resolves via
+    /// `Transcript.text(from:to:)` (word-precise where available, whole-segment fallback
+    /// otherwise) instead of the old exact-`start`-match lookup.
     private func segmentText(for highlight: Highlight) -> String {
-        segments.first { $0.start == highlight.start }?.text ?? "(segment not found)"
+        let text = Transcript(segments: segments).text(from: highlight.start, to: highlight.end)
+        return text.isEmpty ? "(segment not found)" : text
     }
 }
 

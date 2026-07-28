@@ -3,32 +3,95 @@ import AVFoundation
 import WhisperKit
 import OSLog
 
+/// One word within a segment, with its own timing (spec §8 Stage 1 — word-level timestamps).
+/// Populated only by providers that actually expose per-word timing (WhisperKit with
+/// `DecodingOptions(wordTimestamps: true)`, whisper.cpp with `-ojf -sow`, OpenAI's whisper-1 with
+/// `timestamp_granularities: ["word"]`) — see each provider's `transcribe(audio:)` for the
+/// real-source citation of its own format. `start`/`end` are in the same absolute (whole-file)
+/// timeline as `TranscriptSegment.start`/`end`, not segment-relative — confirmed for all three
+/// providers before assuming it (WhisperKit/whisper.cpp derive both from the same seek-offset
+/// decode pipeline that already produces absolute segment timestamps; OpenAI's docs example shows
+/// word timestamps in the same units/origin as its segment timestamps).
+struct TranscriptWord: Codable, Hashable {
+    var text: String
+    var start: TimeInterval
+    var end: TimeInterval
+}
+
 struct TranscriptSegment: Identifiable, Codable {
     // SwiftUI/ForEach identity only, not persisted (see CodingKeys below) — nothing keys off a
     // segment's id across a save/reload, a Daily's transcript is replaced whole-array on update.
     let id = UUID()
     // Editable in place (spec §2, "Transcript editing"). `start`/`end` stay fixed to whatever
-    // transcription produced — v1 is text-only correction, no word-level timestamp resync
-    // (spec §5, resolved: deferred, not needed now).
+    // transcription produced.
     var text: String
     let start: TimeInterval
     let end: TimeInterval
     var speaker: String?
+    /// Word-level timing within this segment (spec §8 Stage 1), nil when the provider doesn't
+    /// expose it (Gemini — no internal timestamp structure at all, confirmed against its docs
+    /// during the original Gemini provider work — or a pre-Stage-1 transcript saved before this
+    /// field existed, which Codable's missing-key-on-Optional handling covers for free, same as
+    /// `Daily.frameRate`). Callers needing sub-segment precision (arbitrary text-selection
+    /// highlighting, Stage 2) must handle `nil` by falling back to this segment's own `start`/`end`
+    /// — never assume this is populated.
+    var words: [TranscriptWord]?
 
-    init(text: String, start: TimeInterval, end: TimeInterval, speaker: String? = nil) {
+    init(text: String, start: TimeInterval, end: TimeInterval, speaker: String? = nil, words: [TranscriptWord]? = nil) {
         self.text = text
         self.start = start
         self.end = end
         self.speaker = speaker
+        self.words = words
     }
 
-    private enum CodingKeys: String, CodingKey { case text, start, end, speaker }
+    private enum CodingKeys: String, CodingKey { case text, start, end, speaker, words }
 }
 
 // Codable (spec §8) so a Daily's Transcript can be persisted inline in a Project's single JSON
 // metadata file — no separate transcript sidecar files, see Project.swift's doc comment.
 struct Transcript: Codable {
     var segments: [TranscriptSegment]
+
+    /// The spoken text between `start` and `end` (spec §8 Stage 2 — resolving a sub-segment
+    /// Highlight's range back to text for display). Word-precise when a touched segment has
+    /// `words` (only the words actually overlapping the range are included); falls back to that
+    /// segment's whole `text` when it doesn't (Gemini transcripts, or pre-Stage-1 legacy data) —
+    /// the same graceful-degradation rule Stage 2's selection resolution uses.
+    func text(from start: TimeInterval, to end: TimeInterval) -> String {
+        var parts: [String] = []
+        for segment in segments where segment.end > start && segment.start < end {
+            if let words = segment.words {
+                let matched = words.filter { $0.end > start && $0.start < end }
+                if !matched.isEmpty {
+                    parts.append(Self.joinWords(matched))
+                    continue
+                }
+            }
+            parts.append(segment.text)
+        }
+        return parts.joined(separator: " ")
+    }
+
+    /// Reassembles word tokens into readable text — a plain `joined(separator: " ")` puts a
+    /// space before every token, including punctuation-only ones (`,`/`.`/`?`/etc.), producing
+    /// "silence , Can you see" instead of "silence, Can you see" (caught via real GUI testing:
+    /// visible the moment a Highlight's underlying segment had real word data to reassemble from).
+    /// Punctuation-only tokens attach to the previous word with no leading space instead.
+    private static func joinWords(_ words: [TranscriptWord]) -> String {
+        var result = ""
+        for word in words {
+            guard let first = word.text.first else { continue }
+            // Punctuation-only tokens (`,`/`.`/`?`) and contraction continuations split onto
+            // their own token by whisper.cpp's `-sow` word-splitting (`I` + `'m`, confirmed via
+            // real GUI testing — a real transcript's word list really does split "I'm" this way)
+            // both attach to the previous word with no leading space.
+            let attachesToPrevious = (word.text.allSatisfy { $0.isPunctuation || $0.isSymbol }) || first == "'"
+            if !result.isEmpty && !attachesToPrevious { result += " " }
+            result += word.text
+        }
+        return result
+    }
 }
 
 /// Fires with human-readable phase/progress text plus a determinate fraction (0...1) when the
@@ -81,18 +144,26 @@ struct WhisperKitProvider: TranscriptionProvider {
             // gives a real percent-complete signal, not just a phase label. `nonisolated(unsafe)`
             // is safe here: the callback only ever runs serially on this same transcribe() call.
             nonisolated(unsafe) let pipeRef = pipe
-            let results = try await pipe.transcribe(audioPath: audio.path, callback: { _ in
+            // wordTimestamps: true (spec §8 Stage 1) — WhisperKit only populates
+            // `TranscriptionSegment.words` when explicitly asked (default false, confirmed in
+            // WhisperKit's own Configurations.swift); off by default because it costs an extra
+            // decode pass per TranscribeTask.swift, but this app always wants it now that
+            // word-level highlighting depends on it.
+            let results = try await pipe.transcribe(audioPath: audio.path, decodeOptions: DecodingOptions(wordTimestamps: true), callback: { _ in
                 let fraction = pipeRef.progress.fractionCompleted
                 onStatus?("Transcribing: \(Int(fraction * 100))%", fraction)
                 return true
             })
 
-            let segments = results.flatMap(\.segments).map {
+            let segments = results.flatMap(\.segments).map { segment in
                 TranscriptSegment(
-                    text: $0.text.trimmingSpecialTokenCharacters(),
-                    start: TimeInterval($0.start),
-                    end: TimeInterval($0.end),
-                    speaker: nil
+                    text: segment.text.trimmingSpecialTokenCharacters(),
+                    start: TimeInterval(segment.start),
+                    end: TimeInterval(segment.end),
+                    speaker: nil,
+                    words: segment.words?.map {
+                        TranscriptWord(text: $0.word.trimmingSpecialTokenCharacters(), start: TimeInterval($0.start), end: TimeInterval($0.end))
+                    }
                 )
             }
 
@@ -300,6 +371,13 @@ struct OpenAIWhisperAPIProvider: TranscriptionProvider {
         }
         appendField("model", Self.model)
         appendField("response_format", "verbose_json")
+        // Repeated multipart field, one value per array element (confirmed against OpenAI's own
+        // docs/community examples, spec §8 Stage 1 citation) — requesting both "segment" and
+        // "word" keeps the existing `segments` array in the response *and* adds a top-level
+        // `words` array; requesting "word" alone was not verified to keep `segments` present, so
+        // both are sent rather than risk losing the array this parser already depends on.
+        appendField("timestamp_granularities[]", "segment")
+        appendField("timestamp_granularities[]", "word")
 
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
         body.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(audio.lastPathComponent)\"\r\n".data(using: .utf8)!)
@@ -322,15 +400,38 @@ struct OpenAIWhisperAPIProvider: TranscriptionProvider {
                 let end: Double
                 let text: String
             }
+            // Top-level, sibling of `segments` — NOT nested inside each segment (spec §8 Stage 1
+            // citation: confirmed via OpenAI's own documented example response shape). Paired back
+            // to its containing segment below by time-range overlap, since the API doesn't do that
+            // pairing itself.
+            struct Word: Decodable {
+                let word: String
+                let start: Double
+                let end: Double
+            }
             let segments: [Segment]?
+            let words: [Word]?
             let text: String?
         }
         let decoded = try JSONDecoder().decode(WhisperVerboseResponse.self, from: data)
 
         let segments: [TranscriptSegment]
         if let apiSegments = decoded.segments, !apiSegments.isEmpty {
-            segments = apiSegments.map {
-                TranscriptSegment(text: $0.text.trimmingCharacters(in: .whitespaces), start: $0.start, end: $0.end, speaker: nil)
+            segments = apiSegments.map { segment in
+                // A small epsilon tolerates float rounding between a word's timestamp and its
+                // segment's boundary — without it, a word landing exactly on `segment.end` (or a
+                // hair past it due to rounding) could be silently dropped from every segment.
+                let epsilon = 0.05
+                let words = decoded.words?
+                    .filter { $0.start >= segment.start - epsilon && $0.end <= segment.end + epsilon }
+                    .map { TranscriptWord(text: $0.word, start: $0.start, end: $0.end) }
+                return TranscriptSegment(
+                    text: segment.text.trimmingCharacters(in: .whitespaces),
+                    start: segment.start,
+                    end: segment.end,
+                    speaker: nil,
+                    words: (words?.isEmpty ?? true) ? nil : words
+                )
             }
         } else {
             let duration = try await audioDurationSeconds(audio)

@@ -174,12 +174,15 @@ struct WhisperCppProvider: TranscriptionProvider {
         return outputURL
     }
 
-    /// `-oj` (plain JSON, not `-ojf`/full — token-level detail isn't needed, diarization is
-    /// `SpeakerKit`'s job, not whisper.cpp's `-di`) writes `<outputBase>.json` with a
-    /// `transcription: [{ offsets: { from, to }, text }]` shape (offsets in milliseconds) —
-    /// confirmed against whisper.cpp's own `examples/cli/cli.cpp` source, not assumed (spec §3
-    /// citation). `-np` suppresses the human-readable transcript it'd otherwise print to stdout,
-    /// keeping the process's own output limited to what we're not even reading.
+    /// `-ojf` (full JSON, upgraded from plain `-oj` for spec §8 Stage 1 word-level timestamps) +
+    /// `-sow` (split-on-word) writes `<outputBase>.json` with a
+    /// `transcription: [{ offsets: { from, to }, text, tokens: [{ text, offsets: { from, to } }] }]`
+    /// shape (all offsets in milliseconds) — confirmed against whisper.cpp's own
+    /// `examples/cli/cli.cpp` `output_json` function directly (not assumed): `-sow` makes the
+    /// decoder merge sub-word BPE tokens on word boundaries before `-ojf` writes them out, so each
+    /// segment's `tokens` array becomes real per-word timing rather than raw sub-word pieces (spec
+    /// §3/§8 citation). `-np` suppresses the human-readable transcript it'd otherwise print to
+    /// stdout, keeping the process's own output limited to what we're not even reading.
     private func runWhisperCLI(audio: URL, model: URL) async throws -> [TranscriptSegment] {
         guard let whisperCli = YouTubeDownloader.resourceBinPath("whisper-cli") else {
             throw WhisperCppError.toolNotFound("whisper-cli")
@@ -194,7 +197,7 @@ struct WhisperCppProvider: TranscriptionProvider {
         process.executableURL = URL(fileURLWithPath: whisperCli)
         process.arguments = [
             "-m", model.path, "-f", audio.path,
-            "-oj", "-of", outputBase.path,
+            "-ojf", "-sow", "-of", outputBase.path,
             "-np", "-l", "auto",
         ]
         try await runProcess(process) { status, stderr in
@@ -208,18 +211,44 @@ struct WhisperCppProvider: TranscriptionProvider {
         struct WhisperCppOutput: Decodable {
             struct Segment: Decodable {
                 struct Offsets: Decodable { let from: Double; let to: Double }
+                struct Token: Decodable {
+                    let text: String
+                    // Only present when the token has real per-token timestamps (cli.cpp's
+                    // `output_json` only writes this object when `mt.data.t0 > -1 && mt.t1 > -1`)
+                    // — absent for e.g. the end-of-segment marker token.
+                    let offsets: Offsets?
+                }
                 let offsets: Offsets
                 let text: String
+                let tokens: [Token]?
             }
             let transcription: [Segment]
         }
         let decoded = try JSONDecoder().decode(WhisperCppOutput.self, from: data)
-        return decoded.transcription.map {
-            TranscriptSegment(
-                text: $0.text.trimmingCharacters(in: .whitespaces),
-                start: $0.offsets.from / 1000,
-                end: $0.offsets.to / 1000,
-                speaker: nil
+        return decoded.transcription.map { segment in
+            let words: [TranscriptWord]? = segment.tokens?.compactMap { token in
+                guard let offsets = token.offsets else { return nil }
+                let text = token.text.trimmingCharacters(in: .whitespaces)
+                // Special tokens (`[_BEG_]`, `[_TT_50363]`, `[_EOT_]`, etc. — whisper.cpp's own
+                // vocab names every special token with a leading underscore inside the brackets)
+                // carry real offsets too — cli.cpp writes them into the same `tokens` array as
+                // actual words (confirmed by real GUI testing: `[_BEG_]` showed up as the first
+                // "word" in every segment's word list before this filter existed). Matching on
+                // `[_` specifically (not bracket-wrapped text generally) matters — this bundled
+                // model's own sound annotations use parens, not brackets (confirmed live:
+                // "(eerie music)"), but a broader `[...]` match would still wrongly strip a
+                // legitimate bracketed annotation from another model/language (caught via
+                // adversarial review, not live) — `[_` is specific to whisper.cpp's internal
+                // tokens and won't collide with real transcript text.
+                guard !text.isEmpty, !(text.hasPrefix("[_") && text.hasSuffix("]")) else { return nil }
+                return TranscriptWord(text: text, start: offsets.from / 1000, end: offsets.to / 1000)
+            }
+            return TranscriptSegment(
+                text: segment.text.trimmingCharacters(in: .whitespaces),
+                start: segment.offsets.from / 1000,
+                end: segment.offsets.to / 1000,
+                speaker: nil,
+                words: (words?.isEmpty ?? true) ? nil : words
             )
         }
     }

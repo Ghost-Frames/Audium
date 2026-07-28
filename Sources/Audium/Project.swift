@@ -96,11 +96,19 @@ struct Daily: Codable, Identifiable {
 /// not `TranscriptSegment.id` (regenerated fresh on every decode, deliberately excluded from its
 /// own `Codable` conformance — see that type's doc comment) and not an array index (unstable
 /// across a re-transcribe, which fully replaces `Transcript.segments`). Timestamps are the one
-/// piece of segment identity that's both persisted and stable, so a Highlight looks its segment(s)
-/// back up by matching `start`/`end` against the current transcript at display time. Single-
-/// segment for this pass (`start`/`end` mirror the one highlighted `TranscriptSegment` exactly);
-/// a future cross-segment range is just a wider `start`/`end` pair spanning several segments, no
-/// format change needed. `note` is freeform and optional; no separate `tag`/`color` field — the
+/// piece of segment identity that's both persisted and stable, so a Highlight resolves its
+/// underlying text back up by matching `start`/`end` against the current transcript at display
+/// time (`Transcript.text(from:to:)`).
+///
+/// **Sub-segment since spec §8 Stage 2** (originally single-segment-only — `start`/`end` always
+/// mirrored one whole `TranscriptSegment` exactly, created via a per-segment star-button toggle).
+/// No format change was needed to support that: this struct was already a generic `start`/`end`
+/// pair, so an arbitrary cross-segment text selection just produces a narrower or wider range than
+/// before — word-precise where the underlying segment(s) have `TranscriptWord` data (spec §8
+/// Stage 1), or clamped to whichever whole segment(s) touch the selection where they don't
+/// (Gemini transcripts, or pre-Stage-1 legacy data). Every pre-Stage-2 Highlight already on disk
+/// still decodes and displays correctly unchanged — a whole-segment range is just a special case
+/// of an arbitrary range. `note` is freeform and optional; no separate `tag`/`color` field — the
 /// app's design language deliberately uses a single accent color throughout (see
 /// `WaveformBarsView`'s doc comment), so there's no second hue for a highlight color picker to
 /// select between.

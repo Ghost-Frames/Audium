@@ -25,7 +25,8 @@ struct SpeakerDiarizer {
                     text: segment.text,
                     start: segment.start,
                     end: segment.end,
-                    speaker: speakerLabel(for: segment, in: result.segments)
+                    speaker: speakerLabel(for: segment, in: result.segments),
+                    words: segment.words
                 )
             }
             let speakerCount = Set(labeledSegments.compactMap(\.speaker)).count

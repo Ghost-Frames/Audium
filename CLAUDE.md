@@ -40,6 +40,32 @@ the one shared `AudioPlaybackController` — playback stayed shared, per the rev
 per-tab), and Story Editor (the former Paper Edit window's content) is one of those tabs, opened
 on demand via the same toolbar button rather than pinned. All 4 spec-mandated test stages passed
 against the signed app; see spec.md §8's "Tab-based interface + Story Editor tab" subsection.
+Word-level timestamps + arbitrary text-selection highlighting + inline "Add to Paper Edit" are
+implemented (2026-07-28): all three real transcription providers (WhisperKit/whisper.cpp/OpenAI)
+now populate optional per-word timing on `TranscriptSegment.words`; Gemini still can't (no internal
+timestamp structure), so its transcripts fall back to segment-level selection granularity, by
+design. The transcript now renders as one shared `NSTextView` (`TranscriptFlowView.swift`, new
+file) instead of a SwiftUI `Text`-per-segment list — the same "drop to AppKit when SwiftUI can't do
+it" move as `PlayerView`/`AVPlayerView` — so a drag can select an arbitrary, cross-segment phrase; a
+floating "Add Highlight"/"Add to Paper Edit" pill appears over the selection (right-click as
+secondary fallback). `Highlight.start`/`.end` needed no schema change to become sub-segment-precise
+— it was already a generic `TimeInterval` pair. Real GUI testing on Zeus caught two real bugs before
+either reached this stage's completion: `SpeakerDiarizer.labelSpeakers` (shared by all three
+providers) was silently dropping every segment's `words` field when rebuilding segments post-
+diarization, and whisper.cpp's own `[_BEG_]`-style internal tokens were leaking into the word list
+as fake "words" — both fixed and re-verified live (word data confirmed persisted correctly on disk
+after the fix, `[_BEG_]` confirmed gone from a fresh re-transcribe). A follow-up doubt-driven-
+development adversarial review (fresh subagent, no prior context) then caught 4 more real bugs
+(a backwards selection-boundary fallback direction, a rare flag re-arm that could silently eat one
+real click-to-seek, choppy per-word highlight-background painting, an overly broad special-token
+filter) — all fixed; one OpenAI word/segment boundary-pairing edge case was accepted as a documented
+trade-off rather than fixed. Full detail, including one known-but-unresolved edge case (a selection
+starting inside a segment's timestamp/speaker prefix didn't show the floating bar in one re-check —
+not conclusively distinguished from a testing-methodology artifact this session also uncovered:
+the Waveform panel's "Re-transcribe" link and the Transcript panel's floating "Add Highlight"
+button happen to sit at nearly the same x-coordinate in different panels, which caused several
+false "the button doesn't work" readings during this session's own `cliclick`/AXPress testing), in
+spec.md §8's new subsection.
 
 Always read `docs/spec.md` first, before investigating or changing anything. Check its
 "Known Issues" and "Resolved" sections (Section 5) before re-diagnosing something that may
@@ -221,3 +247,33 @@ completely different application's text input instead, with no error from `osasc
 `value of <text field>` directly plus `perform action "AXConfirm" of <text field>` avoided that
 whole class of misdirected-keystroke risk and is the safer default for scripted text entry in
 future sessions.
+
+**Standing practice (as of 2026-07-28): atomic commits — split by concern, don't bundle everything
+since the last commit into one.** If a session touches unrelated features (a bug fix + a new
+feature, or two independent features), commit them separately even when they land in the same
+session — one commit per concern, not one commit per session. **Two concrete violations, don't do
+this again**: `e2254cc` bundled the global-speaker-rename bug fix together with the unrelated Roles
+library re-cull (402→302 skill files) in one commit; `c4e1e39` bundled a small "Clear-clip" button
+addition together with the much larger, unrelated tab-based-interface architecture change in one
+commit. Both are real, separable units of work that got flattened into a single commit message
+covering two different stories — harder to review, harder to revert one without the other, harder
+to `git log`/`git blame` later. Going forward: before committing, check whether the staged diff
+actually represents one concern; if it's two, stage and commit them separately even if both were
+written in the same sitting.
+
+**Standing practice (as of 2026-07-28): adversarial review before marking a non-trivial feature
+done, in addition to (not instead of) real-GUI-testing/source-verification.** For features
+involving subtle invariants — shared state across components, timing/concurrency, format-
+conversion math, multi-step architectural decisions — run a fresh-context adversarial review (the
+`doubt-driven-development` skill: CLAIM → EXTRACT → DOUBT → RECONCILE) before considering the work
+done. This is a different failure mode than the "verify against a real source" lessons already
+above (whisper.cpp's actual release assets, ScriptFixer's actual source, Calibri's actual font
+files, Parakeet's actual benchmarks) — those catch a *fact* the implementing context got wrong;
+adversarial review catches a *reasoning/design* flaw that survives fact-checking precisely because
+the same context that made the decision is also the one checking it, so it re-confirms its own
+blind spots rather than finding them. Does **not** replace real-GUI-testing (spec §8's testing
+discipline) or the interchange-format/live-research practices above — it's an added pass, run
+*before* those or alongside them, specifically for the class of bug that a passing GUI test and a
+correct fact-check both miss: the underlying design decision itself being subtly wrong. Simple UI
+additions (a button, a label, a layout tweak) don't need this — reserve it for the invariant-heavy
+category described above.

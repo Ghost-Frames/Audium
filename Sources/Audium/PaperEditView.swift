@@ -167,7 +167,13 @@ private struct PaperEditEntriesView: View {
             for folder in metadata.folders {
                 guard let daily = folder.dailies.first(where: { $0.id == entry.dailyID }) else { continue }
                 guard let highlight = daily.highlights.first(where: { $0.id == entry.highlightID }) else { return nil }
-                let text = daily.transcript.segments.first { $0.start == highlight.start }?.text ?? "(segment not found)"
+                // Spec §8 Stage 2 — a Highlight's range no longer necessarily matches one whole
+                // segment's `start` exactly (arbitrary text selection), so this resolves via
+                // `Transcript.text(from:to:)` (word-precise where available, whole-segment
+                // fallback otherwise) instead of the old exact-`start`-match lookup — same fix as
+                // `HighlightsListView.segmentText(for:)` in ContentView.swift.
+                let resolvedText = daily.transcript.text(from: highlight.start, to: highlight.end)
+                let text = resolvedText.isEmpty ? "(segment not found)" : resolvedText
                 return ResolvedEntry(id: entry.id, entry: entry, folder: folder, daily: daily, start: highlight.start, end: highlight.end, text: text)
             }
             return nil
