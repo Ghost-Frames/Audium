@@ -5,10 +5,40 @@ import UniformTypeIdentifiers
 import WhisperKit
 import SpeakerKit
 
+/// One open tab (spec §8, tab-based interface) — either a Daily (Preview + Transcript panels) or
+/// the Story Editor (the former separate "Paper Edit" window, now embedded). Deliberately carries
+/// only IDs, not the `Daily`/`ProjectFolder` values themselves — those are looked up fresh from
+/// `project.metadata` whenever needed (`TabBarView.title(for:)`, `ContentView.selectTab`), same
+/// "don't cache what can drift" reasoning as `ContentView.currentHighlights` elsewhere in this
+/// file, so a Daily rename/delete elsewhere can't leave a tab showing stale data.
+private enum ContentTab: Identifiable {
+    case daily(dailyID: UUID, folderID: UUID)
+    case storyEditor
+
+    var id: String {
+        switch self {
+        case .daily(let dailyID, _): return dailyID.uuidString
+        case .storyEditor: return "storyEditor"
+        }
+    }
+}
+
 /// Bento-grid regions per spec §4. Waveform/transcript wiring is real — both drag-and-drop and
 /// YouTube URL input feed the same `runTranscription(on:)`, which respects
 /// `TranscriptionSettings.defaultProvider` (WhisperKit/Gemini/OpenAI); real waveform rendering
 /// and playback (spec §2) live in `AudioPlaybackController`/`WaveformPanel` below.
+///
+/// **Tab architecture (spec §8, tab-based interface, superseding the old single-loaded-Daily
+/// model + separate Paper Edit window):** `openTabs`/`activeTabID` are pure UI bookkeeping — the
+/// actual "what's loaded" state is still the exact same `segments`/`sourceAudioURL`/
+/// `currentDailyID`/`status` `@State` this view already had, reused as-is rather than duplicated
+/// per tab. Activating a Daily tab just calls the existing `loadDaily(_:in:)` again (same call
+/// standalone sidebar clicks already made pre-tabs), which overwrites that shared state and calls
+/// `playback.load(url:)` — so switching tabs is *literally* "select a different Daily" with a new
+/// front-end, not a new loading mechanism. `AudioPlaybackController`/`ProjectController` stay
+/// exactly where the Paper Edit phase promoted them (`AudiumApp`-level `@StateObject`s, injected
+/// via `.environmentObject`) — playback was already shared before this change and stays shared
+/// now, per the revised decision that ruled out per-tab independent playback.
 struct ContentView: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
@@ -26,6 +56,11 @@ struct ContentView: View {
     /// standalone/no-project file). Lets "Re-transcribe" and folder/daily deletion know which
     /// on-disk Daily — if any — the currently-displayed transcript actually belongs to.
     @State private var currentDailyID: UUID?
+    /// Tab-based interface (spec §8) — ordered list of open tabs; `activeTabID` is `ContentTab.id`
+    /// (a plain `String`, not the enum itself, so it survives being looked up against a possibly-
+    /// stale `openTabs` entry without needing `ContentTab` to be `Equatable`).
+    @State private var openTabs: [ContentTab] = []
+    @State private var activeTabID: String?
     /// Batch/folder ingest (spec §9) — sequential, not concurrent (avoids hammering cloud APIs or
     /// overloading local transcription), reusing the exact same `addDaily`/`runTranscription` pipeline
     /// per file as a single drag-and-drop. `batchTotal == 0` means no batch is running.
@@ -59,55 +94,80 @@ struct ContentView: View {
         return "File \(batchIndex) of \(batchTotal) — \(batchCurrentName)"
     }
 
+    private var activeTab: ContentTab? {
+        openTabs.first { $0.id == activeTabID }
+    }
+
+    private var isStoryEditorActive: Bool {
+        if case .storyEditor = activeTab { return true }
+        return false
+    }
+
     var body: some View {
         HStack(spacing: 16) {
             ProjectBrowserPanel(
                 project: project,
-                onSelectDaily: loadDaily,
+                onSelectDaily: activateDailyTab,
                 onDailyDeleted: clearLoadedContentIfMatches,
                 onAddBatch: { urls in Task { await ingestBatch(urls) } }
             )
             .frame(width: 240)
-            GeometryReader { geo in
-                let maxWaveformHeight = max(Self.minWaveformHeight, geo.size.height - Self.minTranscriptHeight - 12)
-                let clampedHeight = min(max(CGFloat(waveformPanelHeight), Self.minWaveformHeight), maxWaveformHeight)
-                VStack(spacing: 0) {
-                    WaveformPanel(
-                        playback: playback,
-                        status: status,
-                        isTargeted: isDropTargeted,
-                        isBusy: isTranscribing,
-                        urlText: $youtubeURLText,
-                        error: youtubeError,
-                        onSubmitURL: { Task { await runYouTubeTranscription(urlString: youtubeURLText) } },
-                        onBrowse: browseForFile,
-                        onRetranscribe: { Task { await retranscribeCurrent() } },
-                        batchProgress: batchProgressText
-                    )
-                    .frame(height: clampedHeight)
-                    .onDrop(of: [.audiovisualContent], isTargeted: $isDropTargeted, perform: handleDrop)
-                    PanelResizeHandle(height: $waveformPanelHeight, minHeight: Self.minWaveformHeight, maxHeight: maxWaveformHeight)
-                    TranscriptPanel(
-                        segments: $segments,
-                        isTranscribing: isTranscribing,
-                        status: status,
-                        statusFraction: statusFraction,
-                        startedAt: transcriptionStartedAt,
-                        sourceURL: sourceAudioURL,
-                        playback: playback,
-                        highlights: currentHighlights,
-                        paperEdits: project.metadata?.paperEdits ?? [],
-                        dailyID: currentDailyID,
-                        onToggleHighlight: toggleHighlight,
-                        onRemoveHighlight: removeHighlight,
-                        onAddToPaperEdit: addToPaperEdit,
-                        onRenameSpeaker: renameSpeaker,
-                        batchProgress: batchProgressText
-                    )
+            VStack(spacing: 0) {
+                // No tabs open (no project, or a project open but nothing clicked yet) shows no
+                // tab bar at all — this is also the standalone/no-project drag-and-drop state,
+                // unchanged from before tabs existed (spec §8 tab decision: standalone ingest
+                // doesn't open a Project-browser Daily, so it doesn't get a tab either).
+                if !openTabs.isEmpty {
+                    TabBarView(tabs: openTabs, activeTabID: activeTabID, project: project, onSelect: selectTab, onClose: closeTab)
+                        .padding(.bottom, 8)
+                }
+                if isStoryEditorActive {
+                    StoryEditorTab(project: project, playback: playback, onPlayEntry: openDailyTabAndPlay)
+                } else {
+                    HStack(spacing: 16) {
+                        GeometryReader { geo in
+                            let maxWaveformHeight = max(Self.minWaveformHeight, geo.size.height - Self.minTranscriptHeight - 12)
+                            let clampedHeight = min(max(CGFloat(waveformPanelHeight), Self.minWaveformHeight), maxWaveformHeight)
+                            VStack(spacing: 0) {
+                                WaveformPanel(
+                                    playback: playback,
+                                    status: status,
+                                    isTargeted: isDropTargeted,
+                                    isBusy: isTranscribing,
+                                    urlText: $youtubeURLText,
+                                    error: youtubeError,
+                                    onSubmitURL: { Task { await runYouTubeTranscription(urlString: youtubeURLText) } },
+                                    onBrowse: browseForFile,
+                                    onRetranscribe: { Task { await retranscribeCurrent() } },
+                                    batchProgress: batchProgressText
+                                )
+                                .frame(height: clampedHeight)
+                                .onDrop(of: [.audiovisualContent], isTargeted: $isDropTargeted, perform: handleDrop)
+                                PanelResizeHandle(height: $waveformPanelHeight, minHeight: Self.minWaveformHeight, maxHeight: maxWaveformHeight)
+                                TranscriptPanel(
+                                    segments: $segments,
+                                    isTranscribing: isTranscribing,
+                                    status: status,
+                                    statusFraction: statusFraction,
+                                    startedAt: transcriptionStartedAt,
+                                    sourceURL: sourceAudioURL,
+                                    playback: playback,
+                                    highlights: currentHighlights,
+                                    paperEdits: project.metadata?.paperEdits ?? [],
+                                    dailyID: currentDailyID,
+                                    onToggleHighlight: toggleHighlight,
+                                    onRemoveHighlight: removeHighlight,
+                                    onAddToPaperEdit: addToPaperEdit,
+                                    onRenameSpeaker: renameSpeaker,
+                                    batchProgress: batchProgressText
+                                )
+                            }
+                        }
+                        AIChatPanel(segments: segments)
+                            .frame(width: 340)
+                    }
                 }
             }
-            AIChatPanel(segments: segments)
-                .frame(width: 340)
         }
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -117,10 +177,16 @@ struct ContentView: View {
             // instead of inside AIChatPanel's header, which was fighting the role/provider
             // pickers for the panel's fixed 340pt width (see the "AI Chat" header overflow fix).
             ToolbarItemGroup(placement: .primaryAction) {
-                Button { openWindow(id: "paperEdit") } label: {
+                // Repurposed, not removed (spec §8 tab decision item 4): the old separate "Paper
+                // Edit" `Window` + its `openWindow(id: "paperEdit")` call and the app-menu
+                // Cmd+Shift+P shortcut are gone entirely (see `AudiumApp.swift`) — this same
+                // toolbar icon now opens/focuses the Story Editor tab instead, so there's still a
+                // one-click way to reach it (Story Editor is opened on demand, not pinned — see
+                // this button and `activateStoryEditorTab()`'s doc comment).
+                Button { activateStoryEditorTab() } label: {
                     Image(systemName: "film.stack")
                 }
-                .help("Paper Edit")
+                .help("Story Editor")
                 Button { openWindow(id: "about") } label: {
                     Image(systemName: "info.circle")
                 }
@@ -143,6 +209,118 @@ struct ContentView: View {
         } message: {
             Text(batchFailures.map { "\($0.name): \($0.error)" }.joined(separator: "\n"))
         }
+        // Switching projects invalidates every open Daily tab's (folderID, dailyID) lookup, same
+        // as `ProjectBrowserPanel`'s own `expandedFolderIDs` reset on this exact `onChange` — the
+        // Story Editor tab is closed too (its Paper Edits belong to the project that just closed),
+        // and whatever was loaded into the shared player is torn down cleanly rather than left
+        // pointing at a Daily from the just-closed project.
+        .onChange(of: project.rootURL) { _, _ in
+            openTabs = []
+            activeTabID = nil
+            currentDailyID = nil
+            segments = []
+            sourceAudioURL = nil
+            playback.reset()
+            status = "Drop an audio or video file to begin"
+            statusFraction = nil
+        }
+    }
+
+    /// Adds `tab` if not already open, then makes it the active tab — the shared "open or focus"
+    /// primitive every tab-opening call site (sidebar click, toolbar button, Paper Edit entry
+    /// play) goes through.
+    private func openTabIfNeeded(_ tab: ContentTab) {
+        if !openTabs.contains(where: { $0.id == tab.id }) {
+            openTabs.append(tab)
+        }
+        activeTabID = tab.id
+    }
+
+    /// Opens/focuses a Daily's tab (spec §8: "Opening a Daily from the Project browser opens/
+    /// focuses a tab" — also the target of a Paper Edit entry's Play button, and of a fresh
+    /// standalone-drop-into-an-open-project ingest). Skips the reload if this tab is already the
+    /// active one — clicking the tab you're already on (or re-clicking the same sidebar Daily)
+    /// shouldn't restart playback; only an actual tab *switch* re-runs `loadDaily`, which is what
+    /// pulls that Daily's content into the one shared `AudioPlaybackController`.
+    private func activateDailyTab(_ daily: Daily, in folder: ProjectFolder) {
+        let tab = ContentTab.daily(dailyID: daily.id, folderID: folder.id)
+        let alreadyActive = activeTabID == tab.id
+        openTabIfNeeded(tab)
+        guard !alreadyActive else { return }
+        loadDaily(daily, in: folder)
+    }
+
+    /// Story Editor is opened **on demand**, not pinned/always-open (spec §8 point 3's explicit
+    /// decision point) — same trigger as the old separate window (one toolbar button), just
+    /// producing a tab instead of a window. Rejected pinned-always-present: it would need special
+    /// "this one tab can't be closed" logic in `closeTab`/`TabBarView` for a feature most sessions
+    /// (plain transcription work, no Paper Edit yet) never touch — on-demand is less code and a
+    /// closer match to how the feature was already reached pre-tabs.
+    private func activateStoryEditorTab() {
+        openTabIfNeeded(.storyEditor)
+    }
+
+    /// Activates an already-known `ContentTab` value — used by `TabBarView`'s click handler and by
+    /// `closeTab`'s fallback-to-next-tab. Re-resolves a `.daily` tab's `Daily`/`ProjectFolder` from
+    /// `project.metadata` fresh (same reasoning as `ContentTab`'s own doc comment); if either has
+    /// vanished (deleted through some path that didn't already prune this tab), the tab is dropped
+    /// instead of activating onto missing data.
+    private func selectTab(_ tab: ContentTab) {
+        switch tab {
+        case .daily(let dailyID, let folderID):
+            guard let metadata = project.metadata,
+                  let folder = metadata.folders.first(where: { $0.id == folderID }),
+                  let daily = folder.dailies.first(where: { $0.id == dailyID }) else {
+                openTabs.removeAll { $0.id == tab.id }
+                if activeTabID == tab.id { activeTabID = openTabs.last?.id }
+                return
+            }
+            activateDailyTab(daily, in: folder)
+        case .storyEditor:
+            activateStoryEditorTab()
+        }
+    }
+
+    /// Closes a tab (spec §8: "Include a way to close a tab"). The playback-stop condition is
+    /// keyed on `currentDailyID` (whatever the shared player actually has loaded right now), not
+    /// on whether the closed tab happened to be the frontmost/active one — a Daily can be loaded
+    /// in the shared player while some *other* tab (e.g. Story Editor) is the one currently in
+    /// front, and closing that Daily's now-background tab should still stop its audio (spec test
+    /// stage 4: "close a tab while its content is actively playing, confirm playback stops
+    /// cleanly").
+    private func closeTab(_ tab: ContentTab) {
+        let wasActive = activeTabID == tab.id
+        openTabs.removeAll { $0.id == tab.id }
+
+        if case .daily(let dailyID, _) = tab, dailyID == currentDailyID {
+            playback.reset()
+            currentDailyID = nil
+            segments = []
+            sourceAudioURL = nil
+            status = "Drop an audio or video file to begin"
+            statusFraction = nil
+        }
+
+        guard wasActive else { return }
+        if let nextTab = openTabs.last {
+            selectTab(nextTab)
+        } else {
+            activeTabID = nil
+        }
+    }
+
+    /// Target of a Paper Edit entry's Play button (spec §8 point 2) — opens/focuses that entry's
+    /// source Daily tab (so the Transcript panel actually shows the context of what's about to
+    /// play, unlike the old separate-window version's deliberate "Transcript panel doesn't follow
+    /// along" scope boundary, which no longer applies now that everything lives in one window with
+    /// real tabs) and only seeks+plays if the media actually loaded — `activateDailyTab` →
+    /// `loadDaily` already turns a missing/moved linked file into a clear `status` message instead
+    /// of silently doing nothing, so there's no need for a second not-found alert here.
+    private func openDailyTabAndPlay(_ daily: Daily, in folder: ProjectFolder, at time: TimeInterval) {
+        activateDailyTab(daily, in: folder)
+        guard playback.isLoaded else { return }
+        playback.seek(to: time)
+        playback.play()
     }
 
     private func handleDrop(providers: [NSItemProvider]) -> Bool {
@@ -214,6 +392,12 @@ struct ContentView: View {
         do {
             let (daily, mediaURL) = try await project.addDaily(from: url, to: folderID)
             currentDailyID = daily.id
+            // Opens a tab for the newly-added Daily (spec §8: ingesting into an open project is
+            // functionally "open this Daily"), same as a sidebar click would — just via
+            // `openTabIfNeeded` directly rather than `activateDailyTab`, since `runTranscription`
+            // right below already does everything `loadDaily` would (`segments`/`sourceAudioURL`/
+            // `playback.load`), no need to load twice.
+            openTabIfNeeded(.daily(dailyID: daily.id, folderID: folderID))
             await runTranscription(on: mediaURL, dailyID: daily.id)
         } catch {
             status = "Couldn't add daily: \(error.localizedDescription)"
@@ -313,6 +497,16 @@ struct ContentView: View {
     /// Only reacts when the deleted Daily is the one actually loaded — deleting some other Daily
     /// (or a folder that doesn't contain the loaded one) shouldn't disturb what's on screen.
     private func clearLoadedContentIfMatches(deletedDailyID: UUID) {
+        // Drops the deleted Daily's tab too, if it had one open (spec §8) — a tab pointing at a
+        // just-deleted Daily would otherwise sit in the tab bar until clicked, at which point
+        // `selectTab`'s own not-found fallback would remove it anyway; doing it eagerly here
+        // avoids that dead intermediate state.
+        let wasActiveTab = activeTabID == deletedDailyID.uuidString
+        openTabs.removeAll { if case .daily(let id, _) = $0 { return id == deletedDailyID }; return false }
+        if wasActiveTab {
+            activeTabID = openTabs.last?.id
+            if let nextTab = openTabs.last { selectTab(nextTab) }
+        }
         guard currentDailyID == deletedDailyID else { return }
         currentDailyID = nil
         segments = []
@@ -708,6 +902,89 @@ private struct ProjectBrowserPanel: View {
         } catch {
             errorText = error.localizedDescription
         }
+    }
+}
+
+/// Tab bar (spec §8, tab-based interface) — one row of `TabChip`s in the app's own glass/cyan
+/// language (item 3's explicit requirement: "not stock unstyled TabView chrome" — SwiftUI's stock
+/// `TabView` also doesn't support a dynamic, closeable, mixed-content set of tabs like this one
+/// anyway, so a plain `HStack` of custom chips is both the styled *and* the mechanically simplest
+/// option here). Titles are looked up live from `project.metadata` each render rather than cached
+/// on `ContentTab` (see that type's doc comment) — cheap at the small number of tabs a user
+/// realistically has open at once.
+private struct TabBarView: View {
+    let tabs: [ContentTab]
+    let activeTabID: String?
+    @ObservedObject var project: ProjectController
+    let onSelect: (ContentTab) -> Void
+    let onClose: (ContentTab) -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(tabs) { tab in
+                TabChip(
+                    title: title(for: tab),
+                    icon: tab.id == "storyEditor" ? "film.stack" : "waveform",
+                    isActive: tab.id == activeTabID,
+                    onSelect: { onSelect(tab) },
+                    onClose: { onClose(tab) }
+                )
+            }
+            Spacer()
+        }
+    }
+
+    private func title(for tab: ContentTab) -> String {
+        switch tab {
+        case .storyEditor:
+            return "Story Editor"
+        case .daily(let dailyID, let folderID):
+            guard let folder = project.metadata?.folders.first(where: { $0.id == folderID }),
+                  let daily = folder.dailies.first(where: { $0.id == dailyID }) else {
+                return "Daily"
+            }
+            return daily.displayName
+        }
+    }
+}
+
+private struct TabChip: View {
+    let title: String
+    let icon: String
+    let isActive: Bool
+    let onSelect: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Button(action: onSelect) {
+                HStack(spacing: 6) {
+                    Image(systemName: icon).font(.caption2)
+                    Text(title).font(.caption.bold()).lineLimit(1)
+                }
+            }
+            .buttonStyle(.plain)
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .buttonStyle(.plain)
+            .opacity(0.6)
+            .help("Close Tab")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .frame(maxWidth: 200)
+        .foregroundStyle(isActive ? Theme.accent : .secondary)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(isActive ? Theme.accent.opacity(0.16) : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(isActive ? Theme.accent.opacity(0.6) : Color.clear, lineWidth: 1)
+        )
+        .contentShape(Rectangle())
     }
 }
 

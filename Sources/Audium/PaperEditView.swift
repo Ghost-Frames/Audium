@@ -2,37 +2,43 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-/// The assembled "selects" reel (spec §8) — a separate window rather than a 5th bento panel,
-/// since the existing 4-panel layout (project tree · waveform/preview · transcript · AI chat) is
-/// already tight at the window's minWidth, and a Paper Edit is a distinct editorial task (review/
-/// reorder the assembly) rather than something used moment-to-moment alongside transcription like
-/// the other panels. Same multi-window pattern as Logs/About (`AudiumApp.swift`), but shares the
-/// *same* `ProjectController`/`AudioPlaybackController` instances (injected via
-/// `.environmentObject`, promoted out of `ContentView` for exactly this) rather than owning
-/// separate copies — clicking an entry drives the one real playback engine, reusing its existing
-/// load/seek/play wiring instead of duplicating it.
+/// The assembled "selects" reel (spec §8) — Story Editor tab, formerly a separate `Window`
+/// (spec §8, "tab-based interface" pass; see `AudiumApp.swift` for the removed `Window("Paper
+/// Edit", ...)` scene and `ContentView.swift` for the tab architecture this now lives inside).
+/// Shares the *same* `ProjectController`/`AudioPlaybackController` instances (`ContentView`'s
+/// `@EnvironmentObject`s, passed down explicitly here since this is now a plain child view, not a
+/// separate Scene) rather than owning separate copies — clicking an entry drives the one real
+/// playback engine, reusing its existing load/seek/play wiring instead of duplicating it. Opened
+/// **on demand** via the toolbar button, not pinned/always-present as a tab — see
+/// `ContentView.activateStoryEditorTab()`'s doc comment for why.
 ///
-/// Playing an entry loads media directly into the shared `AudioPlaybackController` — it does
-/// *not* also update the main window's Transcript panel (`segments`/`currentDailyID` are private
-/// `@State` on `ContentView`, not shared state). A deliberate v1 scope boundary, not an oversight:
-/// syncing that too would mean promoting the main window's whole loaded-file state to shared
-/// state as well, a bigger change than this pass calls for. The Waveform/Preview panel *does*
-/// update live, since it's driven by the same shared `playback` object either way.
+/// Playing an entry now opens/focuses that entry's source Daily **tab** and seeks the shared
+/// player through it (`onPlayEntry`, wired to `ContentView.openDailyTabAndPlay`) — supersedes the
+/// old separate-window version's deliberate scope boundary ("does not also update the main
+/// window's Transcript panel," since `segments`/`currentDailyID` were private, non-shared
+/// `ContentView` state at the time). That boundary doesn't apply anymore: tabs and playback both
+/// live in the one window now, so following a Paper Edit entry to its source Daily's actual
+/// transcript context is the natural behavior, not a bigger change than this pass calls for.
 ///
-/// Sequential "play the whole Paper Edit in order" (auto-advance) is deliberately not built this
-/// pass — each entry can come from a different Daily/media file, so auto-advance means detecting
-/// an entry's end via the time observer, then loading + seeking the *next* entry's file
-/// gaplessly; a real state machine, not a one-line addition. Left as a reasonable v2.1 addition;
-/// clicking an entry to play from its start covers this pass's actual requirement.
-struct PaperEditView: View {
-    @EnvironmentObject private var project: ProjectController
-    @EnvironmentObject private var playback: AudioPlaybackController
+/// Sequential "play the whole Paper Edit in order" (auto-advance) is still deliberately not built
+/// — each entry can come from a different Daily/media file, so auto-advance means detecting an
+/// entry's end via the time observer, then loading + seeking the *next* entry's file gaplessly; a
+/// real state machine, not a one-line addition. Left as a reasonable v2.1 addition; clicking an
+/// entry to play from its start covers this pass's actual requirement.
+struct StoryEditorTab: View {
+    @ObservedObject var project: ProjectController
+    @ObservedObject var playback: AudioPlaybackController
+    /// Routes a Play click to `ContentView.openDailyTabAndPlay` — opens/focuses the entry's
+    /// source Daily tab, then seeks+plays through the shared player. A missing/moved linked
+    /// source file surfaces as that Daily tab's own "Linked file not found" status message (same
+    /// mechanism `ContentView.loadDaily` already uses elsewhere), so this view no longer needs
+    /// its own separate not-found alert.
+    let onPlayEntry: (Daily, ProjectFolder, TimeInterval) -> Void
 
     @State private var selectedPaperEditID: UUID?
     @State private var showingNewAlert = false
     @State private var newName = ""
     @State private var pendingDelete: PaperEdit?
-    @State private var missingMediaError: String?
 
     private var paperEdits: [PaperEdit] { project.metadata?.paperEdits ?? [] }
 
@@ -45,25 +51,20 @@ struct PaperEditView: View {
             if project.metadata == nil {
                 emptyState("No project open — open a project in the main window to build a Paper Edit.")
             } else {
-                HStack(spacing: 0) {
+                HStack(spacing: 16) {
                     sidebar
-                    Divider()
                     if let selectedPaperEdit {
-                        PaperEditEntriesView(project: project, playback: playback, paperEdit: selectedPaperEdit, missingMediaError: $missingMediaError)
+                        PaperEditEntriesView(project: project, paperEdit: selectedPaperEdit, onPlay: onPlayEntry)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .padding()
+                            .glassPanel()
                     } else {
                         emptyState("No Paper Edit yet — create one, then add highlights to it from the Transcript panel's ★ list.")
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .glassPanel()
                     }
                 }
             }
-        }
-        .background(Theme.background)
-        .frame(minWidth: 520, minHeight: 400)
-        .alert("File Not Found", isPresented: Binding(get: { missingMediaError != nil }, set: { if !$0 { missingMediaError = nil } })) {
-            Button("OK", role: .cancel) { missingMediaError = nil }
-        } message: {
-            Text(missingMediaError ?? "")
         }
     }
 
@@ -95,7 +96,9 @@ struct PaperEditView: View {
             Spacer()
         }
         .padding()
-        .frame(width: 160)
+        .frame(width: 200)
+        .frame(maxHeight: .infinity)
+        .glassPanel()
         .alert("New Paper Edit", isPresented: $showingNewAlert) {
             TextField("Name", text: $newName)
             Button("Create") {
@@ -149,9 +152,11 @@ private struct ResolvedEntry: Identifiable {
 
 private struct PaperEditEntriesView: View {
     @ObservedObject var project: ProjectController
-    @ObservedObject var playback: AudioPlaybackController
     let paperEdit: PaperEdit
-    @Binding var missingMediaError: String?
+    /// Opens/focuses the entry's source Daily tab and seeks+plays through the shared player
+    /// (`ContentView.openDailyTabAndPlay`) — see `StoryEditorTab`'s doc comment for why this
+    /// replaced directly driving `playback` from here.
+    let onPlay: (Daily, ProjectFolder, TimeInterval) -> Void
 
     /// Entries whose Highlight/Daily still resolve — `removeHighlight`/`deleteDaily`/
     /// `deleteFolder` all cascade-clean dangling entries already, so a `nil` here would only mean
@@ -215,23 +220,12 @@ private struct PaperEditEntriesView: View {
         }
     }
 
-    /// Reuses the existing playback wiring (spec §8: "reuse existing playback wiring, don't
-    /// duplicate it") — same `mediaURL(for:in:)`/`load`/`seek` any sidebar Daily click already
-    /// goes through, just triggered from here instead, then starts playback since the point of
-    /// clicking a Paper Edit entry is to *hear* it, not just load it paused.
+    /// Opens/focuses the entry's source Daily tab and seeks+plays it (spec §8 point 2) — routes
+    /// through `ContentView.openDailyTabAndPlay` rather than driving `playback` directly (see
+    /// `StoryEditorTab`'s doc comment); that function's own `activateDailyTab` → `loadDaily` chain
+    /// already handles a missing/moved linked source file.
     private func play(_ item: ResolvedEntry) {
-        // Linked media (spec §8) can vanish out from under the project — checked here for the
-        // same reason `ContentView.loadDaily` checks it, so a moved/deleted source file surfaces
-        // as a clear alert instead of `playback.load` silently doing nothing.
-        guard project.mediaExists(for: item.daily, in: item.folder) else {
-            let url = project.mediaURL(for: item.daily, in: item.folder)
-            missingMediaError = "Linked file not found for \"\(item.daily.displayName)\": \(url.path) — it may have been moved, renamed, or deleted."
-            return
-        }
-        let url = project.mediaURL(for: item.daily, in: item.folder)
-        playback.load(url: url)
-        playback.seek(to: item.start)
-        playback.play()
+        onPlay(item.daily, item.folder, item.start)
     }
 
     /// Removes just this entry — the underlying Highlight is untouched (spec: independent).

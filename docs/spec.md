@@ -1692,6 +1692,162 @@ Left the test project (`~/Developer/TestFiles/New Project`) and scratch media
 (`~/Desktop/AudiumTestMedia/`) on disk rather than cleaning them up automatically — harmless, and
 useful if a future session wants to re-verify without re-seeding from scratch.
 
+### Tab-based interface + Story Editor tab (replaces single-loaded-Daily model + Paper Edit window) — implemented (2026-07-28)
+
+Replaces the "one Daily loaded into the Waveform/Transcript panels at a time" model (unchanged
+since Phase 2, spec §8) and the separate Paper Edit `Window` (spec §8, Paper Edit assembly phase)
+with a tab bar: a tab is either an open Daily (Preview/Waveform + Transcript panels) or the Story
+Editor (the former Paper Edit window's content). Multiple Dailies can have tabs open at once;
+switching tabs changes what's loaded into the one shared player, same mental model as Avid/Premiere
+switching between open sequences.
+
+**REVISED DECISION carried through unchanged, not re-litigated**: playback stays **shared**, not
+per-tab. `AudioPlaybackController`/`ProjectController` were already promoted to `AudiumApp`-level
+`@StateObject`s during the Paper Edit phase (spec §8) specifically so the old separate window could
+drive the same playback engine as the main window; this pass keeps that promotion exactly as-is —
+no reversal, no per-tab controller instances. Confirmed unchanged: `AudiumApp.swift` still injects
+the same two `@StateObject`s via `.environmentObject` into `WindowGroup`/`Settings` (`Window("Paper
+Edit", ...)` is gone, so there's one Scene needing them now instead of two, but the objects
+themselves and the injection pattern are untouched).
+
+**Tab architecture (`ContentView.swift`)**: a private `ContentTab` enum (`.daily(dailyID:,
+folderID:)` / `.storyEditor`), `@State private var openTabs: [ContentTab]` +
+`@State private var activeTabID: String?`. Deliberately carries only IDs, not `Daily`/
+`ProjectFolder` values — those are looked up fresh from `project.metadata` wherever a tab's display
+title or content is needed (`TabBarView.title(for:)`, `ContentView.selectTab`), same "don't cache
+what can drift" reasoning `ContentView.currentHighlights` already used elsewhere in this file, so a
+tab can't show stale data if its Daily is renamed/mutated elsewhere.
+
+**The load mechanism is unchanged, not reinvented**: `openTabs`/`activeTabID` are pure UI
+bookkeeping layered on top of the exact same `segments`/`sourceAudioURL`/`currentDailyID`/`status`
+`@State` `ContentView` already had. Activating a Daily tab (`activateDailyTab`) just calls the
+existing `loadDaily(_:in:)` again — literally the same function a sidebar Daily click called before
+tabs existed. Switching tabs is "select a different Daily" with a tab-bar front end, not a new
+loading mechanism; this is also why standalone (no-project) drag-and-drop needed zero changes —
+`ingest()`'s no-project branch never touches `openTabs` at all.
+
+**Tab lifecycle, all in `ContentView.swift`**:
+- `openTabIfNeeded(_:)` — shared "open or focus" primitive every tab-opening call site goes
+  through (sidebar click, toolbar button, Paper Edit entry Play, project ingest).
+- `activateDailyTab(_:in:)` — opens/focuses a Daily's tab; skips `loadDaily` entirely if that tab
+  is already the active one, so re-clicking the sidebar entry (or a Paper Edit Play button) for a
+  Daily whose tab is already frontmost doesn't restart playback with an audible glitch.
+- `activateStoryEditorTab()` — opens/focuses the Story Editor tab. **On demand, not pinned** (see
+  decision below).
+- `selectTab(_:)` — activates an already-known `ContentTab`, used by `TabBarView`'s click handler
+  and `closeTab`'s fallback-to-next-tab; re-resolves a `.daily` tab's `Daily`/`ProjectFolder` from
+  `project.metadata` fresh, dropping the tab instead of activating onto missing data if either has
+  vanished through some path that didn't already prune it.
+- `closeTab(_:)` — spec point 1 ("include a way to close a tab"). The playback-stop condition is
+  keyed on `currentDailyID == ` the closed tab's `dailyID`, **not** on whether the closed tab was
+  the frontmost/active one — a Daily can be loaded in the shared player while some other tab (e.g.
+  Story Editor) is in front, and closing that Daily's now-background tab must still stop its audio.
+  Real-tested (see below): this exact "switch away, then close the tab that's still playing in the
+  background" case, confirmed via `lsof` showing the media file's file descriptor actually released
+  (not just paused) once the matching tab closed.
+- `openDailyTabAndPlay(_:in:at:)` — target of a Paper Edit entry's Play button (see below).
+- `clearLoadedContentIfMatches`/`ingest()` updated to keep tabs in sync with Daily
+  deletion/creation (drops a deleted Daily's tab; opens a tab for a freshly-ingested one).
+- `.onChange(of: project.rootURL)` on `ContentView`'s body clears all tabs and resets the shared
+  player when the project changes/closes — same precedent as `ProjectBrowserPanel`'s existing
+  `expandedFolderIDs` reset on the identical `onChange`.
+
+**Tab bar UI (`TabBarView`/`TabChip`, `ContentView.swift`)**: a plain `HStack` of custom chips in
+the app's existing glass/cyan language, not stock `TabView` chrome (spec point 3's explicit
+requirement — SwiftUI's stock `TabView` also doesn't support a dynamic, closeable, mixed-content
+tab set like this one anyway, so a styled `HStack` was both the required look and the mechanically
+simplest option). Active tab: cyan text/icon, `Theme.accent.opacity(0.16)` fill, cyan stroke.
+Inactive: secondary/gray, no fill. Each chip has its own close (×) button. The tab bar row is only
+rendered when `openTabs` is non-empty — a project with nothing opened yet (or no project at all)
+shows no tab bar at all, identical to the pre-tabs standalone-drop screen.
+
+**Default-open decision (spec point 3, explicitly required to be documented): Story Editor opens
+on demand, not pinned/always-present.** Same trigger as the old separate window — one toolbar
+button (`film.stack` icon, repurposed — see below) — just producing a tab instead of a window.
+Rejected pinned-always-open: it would need special "this one tab can't be closed" logic in
+`closeTab`/`TabBarView` for a feature most sessions (plain transcription work, no Paper Edit yet)
+never touch; on-demand is less code and a closer behavioral match to how the feature was already
+reached before tabs existed.
+
+**Story Editor tab (`PaperEditView.swift`, `PaperEditView` struct renamed to `StoryEditorTab`)**:
+same content as the old window — `PaperEditEntriesView`/`PaperEditEntryRow`/`ResolvedEntry` are
+unchanged types, multiple named Paper Edits, drag-reorder via `List.onMove`, EDL/`.docx` export all
+work identically. Only the outer container changed: no more `Window`-specific chrome
+(`.frame(minWidth:...)`, `.background(Theme.background)`), sidebar + entries list each wrapped in
+`.glassPanel()` to match the bento panels it's now embedded alongside instead of floating unstyled
+in its own window.
+
+**Play routing changed — supersedes the old window's deliberate scope boundary.** The old separate
+window's doc comment explicitly called out "playing an entry does *not* also update the main
+window's Transcript panel" as a deliberate v1 boundary, since `segments`/`currentDailyID` were
+private, non-shared `ContentView` state at the time. That boundary is gone: `StoryEditorTab` now
+takes an `onPlayEntry: (Daily, ProjectFolder, TimeInterval) -> Void` closure
+(`ContentView.openDailyTabAndPlay`), which opens/focuses the entry's source Daily tab, then
+seeks+plays through the shared player — so clicking Play now shows you the actual transcript
+context of what's playing, not just the waveform. `PaperEditEntriesView.play(_:)` shrank from
+directly driving `playback`/checking `project.mediaExists` (with its own `missingMediaError` alert)
+down to a one-line call into this closure — the missing-media check still happens, just inside
+`activateDailyTab` → `loadDaily`'s existing "Linked file not found" `status` message instead of a
+second, separate alert mechanism.
+
+**Toolbar (spec point 4: "remove the now-redundant separate Paper Edit window button/shortcut")**:
+`AudiumApp.swift`'s `Window("Paper Edit", id: "paperEdit")` scene and the `Cmd+Shift+P`
+`CommandGroup` button are both deleted outright, not just disabled. `ContentView`'s existing
+toolbar `film.stack` icon button is **repurposed, not removed** — it now calls
+`activateStoryEditorTab()` instead of `openWindow(id: "paperEdit")`, so there's still a one-click
+way to reach Story Editor (necessary given the "opens on demand" decision above — Story Editor
+needs *some* always-visible entry point). No replacement keyboard shortcut was added for
+Cmd+Shift+P — the task said remove the shortcut, and `AudiumApp`'s app-menu `Button` had no access
+to `ContentView`'s local tab state to repurpose it the way the toolbar button could.
+
+**Real GUI test, all 4 stages (signed `build/Audium.app`, Zeus/Intel)** — reused the existing
+"New Project" test project (`~/Developer/TestFiles/New Project`, from the media-linking session
+above), which already had 2 real linked Dailies (`Fontaines DC - Can You Feel My Heart`, a real
+song with a 12-segment 2-speaker transcript; `clip1`, a real video). Added a 3rd (`Scene1_take3`, a
+6-second `say`-synthesized clip, seeded directly on disk per this project's established
+NSOpenPanel-isn't-automatable precedent — legitimate test-data setup, not a shortcut around the tab
+feature under test) to have 3 real Dailies to open as tabs:
+
+1. **Tab open/switch (spec test bullet 1)**: opened all 3 Dailies from the sidebar in sequence —
+   each opened a new tab (cyan-accented chip, correct waveform/video preview, correct real
+   transcript text) without disturbing the previously-opened tabs. Switched back to the first tab
+   (`Fontaines DC`) after opening the third — confirmed its full 12-segment transcript and waveform
+   reloaded correctly, not stale/blank from having been backgrounded. Confirmed via screenshots at
+   each step.
+2. **Story Editor tab (spec test bullet 2)**: starred one segment each on `Fontaines DC` and
+   `Scene1_take3` (real star-button clicks), added both to a new Paper Edit via the Highlights
+   popover's "New Paper Edit…"/existing-Paper-Edit menu (confirmed on-disk in
+   `.audiumproject.json`: one `PaperEdit` with 2 entries spanning both `dailyID`s). Opened Story
+   Editor via the repurposed toolbar button — appeared as a 4th tab alongside the 3 still-open Daily
+   tabs (opening it did **not** close or disturb any of them, confirming "on demand" doesn't mean
+   "exclusive"). Sidebar showed "Paper Edits"/"+ New"/"Paper Edit 1"; main area showed both entries
+   with correct Daily name, timestamp range, and highlighted text, Export EDL/Docx buttons present
+   — visually and functionally identical to the old window's content.
+3. **Paper Edit entry Play → tab focus + seek (spec test bullet 3)**: with Story Editor as the
+   active tab (not any Daily tab), clicked the `Fontaines DC` entry's Play button. Confirmed: the
+   tab bar's active tab switched to `Fontaines DC` (cyan), the Waveform panel showed the pause icon
+   (playing) with elapsed time ~00:25 against the highlight's real start (23.76s — correctly
+   seeked, already advancing a couple seconds past start by the time the screenshot was taken), and
+   the Transcript panel's 00:23 segment showed the full accent-tint "currently playing" row state —
+   confirming playhead sync is correctly wired through the newly-focused tab, not just that audio
+   started somewhere in the background.
+4. **Close tab during playback stops cleanly (spec test bullet 4)** — tested the harder variant:
+   switched *away* from the now-playing `Fontaines DC` tab to Story Editor (audio kept playing in
+   the background, tab bar showed `Fontaines DC` as open-but-inactive), then closed the `Fontaines
+   DC` tab from the tab bar while Story Editor stayed active. Confirmed two ways: visually, the tab
+   disappeared from the bar and Story Editor remained the active tab (no unwanted tab-switch, since
+   the closed tab wasn't the frontmost one); empirically, `lsof -c Audium | grep -i wav` returned
+   **zero open file handles** to the Fontaines media file immediately after — proof `playback.reset()`
+   actually tore down the `AVAudioPlayer` (which holds the file open while loaded) rather than just
+   pausing it or leaving stale state. Re-opened `Fontaines DC` from the sidebar afterward to confirm
+   the tab lifecycle recovers cleanly post-close: reopened as a fresh tab, correct waveform/
+   transcript/highlight state, no leftover corruption from the close.
+
+**Confidence level**: all 4 spec-mandated test stages passed via real GUI interaction against the
+signed app, not just code review — including the empirical `lsof` check for stage 4, which is
+stronger evidence than a visual-only check would have been (a paused-but-still-loaded player would
+look identical on screen to a fully torn-down one).
+
 ### AI Chat header overflow bug — fixed (2026-07-23)
 
 Adding the role picker (above) to `AIChatPanel`'s header row made "AI Chat" render as a
@@ -1850,6 +2006,13 @@ Rough phase order, to be refined as each lands:
    gracefully — verified with a real 4-file batch including a deliberately-corrupted file that
    failed cleanly without aborting the other 3. See the dedicated subsection above ("Batch/folder
    transcription — implemented") for full detail.
+10. Tab-based interface + Story Editor tab — **complete (2026-07-28)**, replaces the single-
+    loaded-Daily model and the separate Paper Edit window with a tab bar (Daily tabs + one Story
+    Editor tab), playback kept shared (not per-tab) per the revised decision, Story Editor opened
+    on demand rather than pinned. All 4 spec-mandated test stages passed against the signed app,
+    including an empirical `lsof` check confirming a closed tab's playback actually tears down
+    (not just pauses). See the dedicated subsection above ("Tab-based interface + Story Editor tab
+    — implemented") for full detail.
 
 ## 9. v2 Roadmap — Additional Items (not yet sequenced against Section 8 above)
 

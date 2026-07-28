@@ -5,12 +5,16 @@ import WhisperKit
 struct AudiumApp: App {
     @Environment(\.openWindow) private var openWindow
 
-    /// Promoted from `ContentView`'s own `@StateObject` (spec §8, Paper Edit) so the separate
-    /// Paper Edit window can drive the *same* project/playback state rather than a second copy —
-    /// clicking a Paper Edit entry loads/seeks/plays through this one shared
-    /// `AudioPlaybackController`, reusing the existing playback wiring instead of duplicating it.
-    /// Injected into each Scene below via `.environmentObject`, since SwiftUI's environment
-    /// doesn't cross Scene boundaries on its own.
+    /// Promoted from `ContentView`'s own `@StateObject` during the Paper Edit phase (spec §8) —
+    /// originally so the (now-removed) separate Paper Edit window could drive the same project/
+    /// playback state as the main window rather than a second copy. Stayed promoted through the
+    /// later tab-based-interface pass (spec §8): the REVISED DECISION there kept playback SHARED
+    /// across tabs (one `AudioPlaybackController` for whichever tab is active, not one per tab,
+    /// same as a single Avid/Premiere sequence player) rather than reversing this promotion, so
+    /// this `@StateObject` placement needed no change even though the Paper Edit *window* it was
+    /// originally built for is gone. Injected into `WindowGroup`/`Settings` below via
+    /// `.environmentObject` — `ContentView` now owns Story Editor as an internal tab rather than a
+    /// second Scene, but the environment injection pattern itself is unchanged.
     @StateObject private var project = ProjectController()
     @StateObject private var playback = AudioPlaybackController()
 
@@ -36,8 +40,6 @@ struct AudiumApp: App {
             CommandGroup(after: .windowArrangement) {
                 Button("Show Logs") { openWindow(id: "logs") }
                     .keyboardShortcut("l", modifiers: [.command, .shift])
-                Button("Paper Edit") { openWindow(id: "paperEdit") }
-                    .keyboardShortcut("p", modifiers: [.command, .shift])
             }
         }
 
@@ -55,12 +57,5 @@ struct AudiumApp: App {
         }
         .defaultSize(width: 320, height: 320)
         .windowResizability(.contentSize)
-
-        Window("Paper Edit", id: "paperEdit") {
-            PaperEditView()
-                .environmentObject(project)
-                .environmentObject(playback)
-        }
-        .defaultSize(width: 520, height: 600)
     }
 }

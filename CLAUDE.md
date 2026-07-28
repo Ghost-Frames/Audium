@@ -33,7 +33,13 @@ whisper.cpp format conversions) — `CacheSettings` (UserDefaults-backed, defaul
 `~/Library/Caches/com.postproduction.Audium/`), overridable in Settings, same conceptual model as
 Avid's Media Cache. Full real-GUI-tested detail (link-not-copy disk verification, moved-file
 graceful-failure test, custom-cache-location derived-file verification, relaunch persistence) in
-spec.md §8's "Media linking (not copying) + global cache location" subsection.
+spec.md §8's "Media linking (not copying) + global cache location" subsection. The single-loaded-
+Daily model and the separate Paper Edit window are both gone as of 2026-07-28: a tab-based
+interface now lets multiple Dailies stay open as tabs (only the active tab's content loads into
+the one shared `AudioPlaybackController` — playback stayed shared, per the revised decision, not
+per-tab), and Story Editor (the former Paper Edit window's content) is one of those tabs, opened
+on demand via the same toolbar button rather than pinned. All 4 spec-mandated test stages passed
+against the signed app; see spec.md §8's "Tab-based interface + Story Editor tab" subsection.
 
 Always read `docs/spec.md` first, before investigating or changing anything. Check its
 "Known Issues" and "Resolved" sections (Section 5) before re-diagnosing something that may
