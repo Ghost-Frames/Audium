@@ -1563,6 +1563,135 @@ instead, with no error) — setting `value of <text field>` directly plus `perfo
 "AXConfirm"` avoided the whole class of misdirected-keystroke risk and is the safer default for
 any future scripted text entry.
 
+### Media linking (not copying) + global cache location — implemented (2026-07-28)
+
+Two related architecture changes, per explicit user decision: (1) Dailies always **link** to
+source media, never copy/import — no per-Daily or per-project choice, this is the only behavior
+going forward; (2) derived/temporary files (extracted audio, YouTube downloads, whisper.cpp
+format conversions) write to **one global cache location** (app-wide Settings preference), not
+scattered per-run system-temp directories — same conceptual model as Avid's Media Cache setting.
+
+**Investigated first, per standing practice**: `ProjectController.addDaily(from:to:)` did copy —
+confirmed by reading it before changing anything. `Daily`'s own doc comment even documented the
+copy as a deliberate v2-Phase-2 tradeoff ("keeps the project folder self-contained... sidesteps
+dangling references... a future 'reference instead of copy' toggle is a reasonable follow-up if
+that becomes a real pain point, not built now"). That follow-up is this session's work, now that
+the user has actually asked for it.
+
+**Sandbox check before choosing path vs. bookmark**: no `.entitlements` file exists anywhere in
+the repo, and `build.sh` signs with a stable local self-signed "Audium Local Dev" identity (ad-hoc/
+local-dev signing, no App Sandbox capability, no hardened-runtime entitlements plist) — confirmed
+by `find`-ing for entitlements files and reading `build.sh`'s codesign invocation directly, not
+assumed. Since this app isn't sandboxed, a security-scoped bookmark (whose entire purpose is
+letting a *sandboxed* process re-acquire access to a file across launches without re-prompting)
+buys nothing here — a plain absolute path (`Daily.linkedSourcePath: String?`) is sufficient and
+simpler. If Audium is ever sandboxed later, this is the spot that would need to switch to
+`NSURL.bookmarkData(options: .withSecurityScope, ...)`.
+
+**Implementation**:
+- `Daily` gained `linkedSourcePath: String?` — the source file's absolute path. `nil` means "this
+  is a pre-existing Daily from before this change, still a real copy living at `mediaFilename`
+  inside its ProjectFolder directory" — the *only* meaning of nil, not "unknown". `mediaFilename`
+  is kept for both cases (extension recovery in `PaperEditView.exportEDL`'s clip-name comment;
+  for a legacy copied Daily it's still also the real on-disk relative filename).
+- `addDaily` no longer calls `FileManager.copyItem` — it captures `sourceURL.path` into
+  `linkedSourcePath` directly. Since the old copy's throw doubled as an implicit "is this file
+  actually readable" check, an explicit `FileManager.fileExists` guard replaces it
+  (`ProjectError.sourceFileNotFound`, a new case, on failure).
+- `ProjectController.mediaURL(for:in:)` branches on `linkedSourcePath`: present → that absolute
+  path; nil → the old folder-relative lookup (legacy copied Dailies keep working exactly as
+  before, unmodified — see "existing test projects" below).
+- New `ProjectController.mediaExists(for:in:) -> Bool` — checked by every playback/transcribe
+  call site before touching a linked Daily's media, since it can now vanish at any time (moved,
+  renamed, deleted, external drive unmounted) — it's no longer owned/protected by the project.
+  `ContentView.loadDaily` and `PaperEditView`'s entry-play both check this first and show a clear
+  message ("Linked file not found: \<path\> — it may have been moved, renamed, or deleted.") via
+  the existing `status` string / a new `missingMediaError` alert respectively, instead of letting
+  `AVAudioPlayer(contentsOf:)`'s `try?` silently swallow the failure (the pre-existing behavior,
+  which read as "nothing happened" with no indication anything was wrong).
+- `deleteDaily` now only removes the on-disk media file for a legacy copied Daily
+  (`linkedSourcePath == nil`) — deleting a linked Daily must never delete the user's own source
+  file, which lives entirely outside the project.
+- **Real bug caught during GUI testing, not just code review**: `ContentView.handleDrop`
+  (Finder-drag entry point) still used `NSItemProvider.loadFileRepresentation`, which Apple's own
+  docs describe as vending a *temporary* copy of the dropped file that is not guaranteed to exist
+  once the completion handler returns. Under the old copy-into-project model this was harmless —
+  a second copy was about to happen anyway. Under the new link model it meant the first real test
+  run linked straight to that ephemeral temp copy (`linkedSourcePath` pointed into
+  `/var/folders/.../T/<uuid>/...`) instead of the user's actual file — exactly the kind of dangling
+  reference linking is supposed to avoid, just relocated one step earlier. Fixed by switching to
+  `loadInPlaceFileRepresentation` (macOS 11+), which hands back the dropped file's real, permanent
+  on-disk location for a local Finder drag instead of copying it. Confirmed fixed by re-running the
+  real-GUI test below and checking the resulting `linkedSourcePath` pointed at the real source
+  (`/Users/zeus/Downloads/...`), not a temp path.
+- **Existing (pre-change) test projects**: left as-is, not migrated. Their Dailies have
+  `linkedSourcePath == nil` and keep resolving media the old way (folder-relative, still a real
+  copy sitting in the ProjectFolder directory) — `mediaURL`/`mediaExists`/`deleteDaily` all branch
+  correctly on that nil. Only newly-added Dailies going forward use the link path. No migration
+  tool was built (not asked for, and a global find/relink-broken-copies pass is a different,
+  bigger feature than "don't create new copies").
+- New `CacheSettings` enum (`CacheSettings.swift`, same `UserDefaults`-backed pattern as
+  `TranscriptionSettings`/`WhisperModelSettings`): `location: URL` (get/set,
+  `com.postproduction.Audium.cacheLocation` key), defaulting to
+  `~/Library/Caches/com.postproduction.Audium/` when unset (via `FileManager
+  .urls(for:.cachesDirectory,...)`, not a hardcoded path). `freshWorkDirectory()` creates a
+  UUID-named subdirectory under the configured location on demand — same per-call isolation the
+  scattered `FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)`
+  call sites already used, just rooted at the configured location instead of system temp.
+- Rewired every derived/temp-file write site named in the task: `extractedAudioURL` (video→audio
+  extraction, `TranscriptionProvider.swift`), `YouTubeDownloader.downloadAudioInner`'s `workDir`,
+  and `WhisperCppProvider`'s `convertToWAV` + `runWhisperCLI` (`-of` output base) all now call
+  `CacheSettings.freshWorkDirectory()` instead of `FileManager.default.temporaryDirectory`.
+  whisper.cpp/WhisperKit *model* downloads (`WhisperCppModelManager.modelsDirectory`) are
+  deliberately untouched — out of scope (models are long-lived assets in Application Support, not
+  scratch files from one transcription run; the task named extracted-audio/YouTube/format-
+  conversion files specifically).
+- New Settings section (`SettingsView.cacheLocationSection`, same glass-panel pattern as every
+  other section): shows the current path, "Choose…" (`NSOpenPanel`, directories only) and "Reset
+  to Default" (only shown when not already at the default).
+- **Known, accepted gap, not built this pass**: derived files written under the configured cache
+  location aren't proactively cleaned up on a schedule — `WhisperCppProvider`'s own WAV/JSON
+  work directories already clean up after themselves via `defer`, but `extractedAudioURL`'s `.m4a`
+  extraction output does not (this was already true before this change, when it wrote to system
+  temp — moving it to a persistent Caches location just makes any accumulation more visible over
+  time instead of the OS silently reaping system-temp). No one has asked for cache eviction yet;
+  flagged here rather than silently built or silently ignored.
+
+**Real GUI test** (signed `build/Audium.app`, all four scenarios from the task, run against a
+real project with the user driving the three steps this app's own testing history has established
+are not synthetically automatable — `NSSavePanel`/`NSOpenPanel` confirmation and Finder-drag
+release — while every disk/`UserDefaults`/log check ran automated):
+1. **Link, not copy**: created a project (`New Project` → saved via `NSSavePanel`), added a
+   `Scene1` folder, dragged a real file (`~/Downloads/Fontaines DC - Can You Feel My Heart.wav`,
+   ~40MB) into the drop zone. Confirmed on disk: `Scene1/` directory empty (`ls -la`, only `.`/
+   `..`), whole project folder `du -sh` = 4.0K (just the JSON), and `.audiumproject.json`'s
+   `linkedSourcePath` pointed at the real Downloads path. Real `whisper.cpp` transcription ran
+   successfully against the link (12 segments, real song lyrics, real `SpeakerKit` diarization
+   labels) — confirms playback/transcription both work correctly off a linked (non-project-owned)
+   file, not just that the reference is stored.
+2. **Missing-link handling**: moved the linked source file to a different folder with a plain
+   `mv` (no GUI needed for this half) without touching the project, then had the user click that
+   Daily in the sidebar again. Result: a clear error state, no crash — confirmed directly by the
+   user. Moved the file back afterward; the project's `linkedSourcePath` was untouched throughout
+   (moving the file doesn't corrupt project state, it just makes the link temporarily unresolvable
+   until the file's back or the user relinks — no relink UI was requested/built this pass).
+3. **Custom cache location + derived files**: set Cache Location in Settings to
+   `~/Desktop/AudiumTestMedia/CustomCache` via the real `Choose…` → `NSOpenPanel` flow, then
+   dragged a synthetic 3-second test video (`ffmpeg`-generated tone+color clip, `clip1.mp4`) in as
+   a second Daily — video dailies trigger `extractedAudioURL`'s video→audio extraction path.
+   Confirmed on disk: `CustomCache/<uuid>/audio.m4a` — the derived file landed exactly where
+   configured, not in system temp or the default Caches location. `UserDefaults` confirmed
+   `com.postproduction.Audium.cacheLocation` = the chosen path.
+4. **Persistence across relaunch**: quit (`osascript -e 'tell application "Audium" to quit'`) and
+   reopened the built `.app` (no GUI needed, not a destructive action). `UserDefaults` still read
+   the custom path immediately after relaunch, and the user confirmed the Settings panel's Cache
+   Location field displayed it correctly on reopen (verifies the `@State` init from
+   `CacheSettings.location` reads the persisted value, not just that the raw default survives).
+
+Left the test project (`~/Developer/TestFiles/New Project`) and scratch media
+(`~/Desktop/AudiumTestMedia/`) on disk rather than cleaning them up automatically — harmless, and
+useful if a future session wants to re-verify without re-seeding from scratch.
+
 ### AI Chat header overflow bug — fixed (2026-07-23)
 
 Adding the role picker (above) to `AIChatPanel`'s header row made "AI Chat" render as a

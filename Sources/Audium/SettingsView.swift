@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import WhisperKit
 
 /// API keys, default providers, and WhisperKit model size (spec §2/§3). Custom glass/cyan layout
@@ -18,6 +19,8 @@ struct SettingsView: View {
 
     @State private var selectedWhisperCppModel = WhisperCppSettings.selectedVariant
 
+    @State private var cacheLocation = CacheSettings.location
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -25,6 +28,7 @@ struct SettingsView: View {
                 transcriptionProviderSection
                 whisperModelSection
                 whisperCppModelSection
+                cacheLocationSection
                 chatProviderSection
             }
             .padding()
@@ -151,6 +155,51 @@ struct SettingsView: View {
         .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassPanel()
+    }
+
+    /// Global cache/render location for derived/temporary files (spec §8, user decision
+    /// 2026-07-28): extracted audio from video-to-transcription conversion, YouTube-downloaded
+    /// audio, whisper.cpp format conversions. One app-wide location, not per-project — same
+    /// conceptual model as Avid's Media Cache setting.
+    private var cacheLocationSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            PanelTitle("Cache Location")
+            Text("Where derived/temporary files (extracted audio, YouTube downloads, format conversions) are written. Defaults to \(CacheSettings.defaultLocation.path).")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(cacheLocation.path)
+                .font(.caption)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .glassPanel(cornerRadius: 10)
+            HStack {
+                Button("Choose…", action: chooseCacheLocation)
+                    .buttonStyle(.accent)
+                if cacheLocation != CacheSettings.defaultLocation {
+                    Button("Reset to Default", action: resetCacheLocation)
+                }
+            }
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassPanel()
+    }
+
+    private func chooseCacheLocation() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Cache Location"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.directoryURL = cacheLocation
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        CacheSettings.location = url
+        cacheLocation = url
+    }
+
+    private func resetCacheLocation() {
+        CacheSettings.location = CacheSettings.defaultLocation
+        cacheLocation = CacheSettings.defaultLocation
     }
 
     private var chatProviderSection: some View {

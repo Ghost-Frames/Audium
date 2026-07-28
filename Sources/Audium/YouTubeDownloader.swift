@@ -84,8 +84,9 @@ enum YouTubeDownloader {
             throw YouTubeDownloadError.toolNotFound("ffmpeg")
         }
 
-        let workDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        // Derived file, not system temp — writes into the configured global cache location (spec
+        // §8, "one global cache/render location", same conceptual model as Avid's Media Cache).
+        let workDir = try CacheSettings.freshWorkDirectory()
         let outputTemplate = workDir.appendingPathComponent("audio.%(ext)s").path
 
         let process = Process()

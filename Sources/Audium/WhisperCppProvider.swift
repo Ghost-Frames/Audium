@@ -156,8 +156,9 @@ struct WhisperCppProvider: TranscriptionProvider {
         guard let ffmpeg = YouTubeDownloader.resourceBinPath("ffmpeg") else {
             throw WhisperCppError.toolNotFound("ffmpeg")
         }
-        let workDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        // Derived file, not system temp — writes into the configured global cache location (spec
+        // §8, "one global cache/render location", same conceptual model as Avid's Media Cache).
+        let workDir = try CacheSettings.freshWorkDirectory()
         let outputURL = workDir.appendingPathComponent("audio.wav")
 
         let process = Process()
@@ -183,8 +184,11 @@ struct WhisperCppProvider: TranscriptionProvider {
         guard let whisperCli = YouTubeDownloader.resourceBinPath("whisper-cli") else {
             throw WhisperCppError.toolNotFound("whisper-cli")
         }
-        let outputBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: outputBase.appendingPathExtension("json")) }
+        // Derived file, not system temp — writes into the configured global cache location (spec
+        // §8, "one global cache/render location", same conceptual model as Avid's Media Cache).
+        let workDir = try CacheSettings.freshWorkDirectory()
+        let outputBase = workDir.appendingPathComponent("output")
+        defer { try? FileManager.default.removeItem(at: workDir) }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: whisperCli)

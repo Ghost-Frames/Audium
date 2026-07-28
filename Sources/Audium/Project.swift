@@ -16,13 +16,19 @@ import Foundation
 ///     Interview - Josh Pratt/
 ///       9F86D081-....mp4
 ///
-/// Media is copied into the project folder when a Daily is added (not referenced in place). This
-/// is a deliberate tradeoff, not an oversight: it keeps the project folder self-contained (matches
-/// "the project folder is what you'd zip and hand off"), sidesteps dangling references if the
-/// original file is later moved/renamed, and handles YouTube-downloaded dailies uniformly — that
-/// source file lives in a temp directory and would vanish otherwise. Cost is doubled disk usage
-/// for video-heavy dailies; a future "reference instead of copy" toggle is a reasonable follow-up
-/// if that becomes a real pain point, not built now (no one has asked for it yet).
+/// Media is **linked**, not copied (spec §8, user decision 2026-07-28 — supersedes this struct's
+/// original "copy into the project folder" design). `ProjectController.addDaily` stores the
+/// source file's absolute path (`Daily.linkedSourcePath`) rather than duplicating the file into
+/// the project folder — this app isn't sandboxed (no entitlements file, ad-hoc/local-dev signed;
+/// confirmed via `build.sh` before choosing this over a security-scoped bookmark, which only
+/// matters for a sandboxed process re-acquiring access across launches), so a plain absolute path
+/// is sufficient and simpler than a bookmark. Trades the old "self-contained, zippable project
+/// folder" property for avoiding doubled disk usage on video-heavy dailies; the source file being
+/// moved/renamed after linking is now a real, handled case (`ProjectController.mediaExists`,
+/// checked before every playback/transcribe attempt) rather than impossible by construction.
+/// Projects created before this change may still have copied media sitting in their folder
+/// structure from the old behavior — left as-is (still works via the same `mediaFilename`-relative
+/// path, `linkedSourcePath` is nil for those Dailies), not migrated; see `addDaily`'s doc comment.
 struct ProjectMetadata: Codable {
     let id: UUID
     var name: String
@@ -62,9 +68,17 @@ struct ProjectFolder: Codable, Identifiable {
 struct Daily: Codable, Identifiable {
     let id: UUID
     var displayName: String
-    /// Filename only, relative to this Daily's ProjectFolder directory — not a full path, so the
-    /// whole project folder can be moved/renamed on disk without breaking the metadata.
+    /// Filename only (e.g. for extension recovery in `PaperEditView.exportEDL`'s clip-name
+    /// comment). For a legacy copied-media Daily (`linkedSourcePath == nil`) this is also a real
+    /// relative path, resolved against this Daily's ProjectFolder directory by `mediaURL(for:in:)`.
+    /// For a linked Daily it's just `linkedSourcePath`'s last path component — the actual location
+    /// is `linkedSourcePath`, not this folder.
     var mediaFilename: String
+    /// Absolute path to the source file outside the project folder (spec §8, "always link, never
+    /// copy" — see this file's top doc comment). `nil` only for Dailies added before this change,
+    /// whose media is still a real copy living at `mediaFilename` inside the ProjectFolder
+    /// directory — that's the sole meaning of nil, not "unknown"/"broken".
+    var linkedSourcePath: String?
     var addedAt: Date
     var transcript: Transcript
     var highlights: [Highlight] = []
@@ -124,6 +138,7 @@ struct PaperEditEntry: Codable, Identifiable {
 enum ProjectError: LocalizedError {
     case folderNotFound
     case notAProjectFolder
+    case sourceFileNotFound
 
     var errorDescription: String? {
         switch self {
@@ -131,6 +146,8 @@ enum ProjectError: LocalizedError {
             return "That folder isn't part of the open project."
         case .notAProjectFolder:
             return "That folder doesn't contain an Audium project (.audiumproject.json not found)."
+        case .sourceFileNotFound:
+            return "That file couldn't be found — it may have been moved, renamed, or deleted."
         }
     }
 }
@@ -201,32 +218,37 @@ final class ProjectController: ObservableObject {
         AudiumLog.project.info("Folder added: \(name, privacy: .public)")
     }
 
-    /// Copies `sourceURL` into the given folder as a new Daily and returns both the Daily and the
-    /// URL it now lives at (so the caller — transcription — doesn't need to re-derive the path).
-    /// `async` (not throws-only) to capture a video Daily's frame rate via
-    /// `AVAssetTrack.load(.nominalFrameRate)` — groundwork for the next phase's EDL export, which
-    /// needs it for timecode conversion (spec §8). Nil for audio-only dailies or if extraction
-    /// fails; failure is non-fatal (`try?`), a missing frame rate shouldn't block adding the Daily.
+    /// Links `sourceURL` into the given folder as a new Daily — stores its absolute path
+    /// (`Daily.linkedSourcePath`) rather than copying the file into the project folder (spec §8,
+    /// "always link, never copy"; see this file's top doc comment for why a plain path and not a
+    /// security-scoped bookmark). Returns both the Daily and the URL it lives at (so the caller —
+    /// transcription — doesn't need to re-derive it). `async` (not throws-only) to capture a video
+    /// Daily's frame rate via `AVAssetTrack.load(.nominalFrameRate)` — groundwork for EDL export,
+    /// which needs it for timecode conversion. Nil for audio-only dailies or if extraction fails;
+    /// failure is non-fatal (`try?`), a missing frame rate shouldn't block adding the Daily.
     @discardableResult
     func addDaily(from sourceURL: URL, to folderID: UUID) async throws -> (daily: Daily, mediaURL: URL) {
-        guard let rootURL, let folder = metadata?.folders.first(where: { $0.id == folderID }) else {
+        guard metadata?.folders.first(where: { $0.id == folderID }) != nil else {
             throw ProjectError.folderNotFound
+        }
+        // No copy to fail on anymore (that used to double as an implicit "does this file actually
+        // exist/is it readable" check via `copyItem`'s own throw) — check explicitly instead.
+        guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+            throw ProjectError.sourceFileNotFound
         }
         let dailyID = UUID()
         let ext = sourceURL.pathExtension
-        let mediaFilename = ext.isEmpty ? dailyID.uuidString : "\(dailyID.uuidString).\(ext)"
-        let destURL = rootURL.appendingPathComponent(folder.name).appendingPathComponent(mediaFilename)
-        try FileManager.default.copyItem(at: sourceURL, to: destURL)
 
         var frameRate: Double?
         if AudioPlaybackController.videoExtensions.contains(ext.lowercased()) {
-            frameRate = await Self.nominalFrameRate(of: destURL)
+            frameRate = await Self.nominalFrameRate(of: sourceURL)
         }
 
         let daily = Daily(
             id: dailyID,
             displayName: sourceURL.deletingPathExtension().lastPathComponent,
-            mediaFilename: mediaFilename,
+            mediaFilename: sourceURL.lastPathComponent,
+            linkedSourcePath: sourceURL.path,
             addedAt: Date(),
             transcript: Transcript(segments: []),
             frameRate: frameRate
@@ -238,8 +260,8 @@ final class ProjectController: ObservableObject {
         selectedFolderID = folderID
         selectedDailyID = dailyID
         try save()
-        AudiumLog.project.info("Daily added: \(daily.displayName, privacy: .public) to folder \(folder.name, privacy: .public)")
-        return (daily, destURL)
+        AudiumLog.project.info("Daily linked: \(daily.displayName, privacy: .public) -> \(sourceURL.path, privacy: .public)")
+        return (daily, sourceURL)
     }
 
     private static func nominalFrameRate(of url: URL) async -> Double? {
@@ -337,7 +359,12 @@ final class ProjectController: ObservableObject {
         guard let dailyIndex = metadata?.folders[folderIndex].dailies.firstIndex(where: { $0.id == dailyID }) else { return }
         let folder = metadata!.folders[folderIndex]
         let daily = folder.dailies[dailyIndex]
-        try? FileManager.default.removeItem(at: mediaURL(for: daily, in: folder))
+        // A linked Daily's media lives outside the project entirely (the user's own source file)
+        // — deleting the Daily must never delete it. Only a legacy copied-media Daily
+        // (`linkedSourcePath == nil`) owns its media file and should have it removed here.
+        if daily.linkedSourcePath == nil {
+            try? FileManager.default.removeItem(at: mediaURL(for: daily, in: folder))
+        }
         metadata?.folders[folderIndex].dailies.remove(at: dailyIndex)
         if selectedDailyID == dailyID { selectedDailyID = nil }
         removeDanglingPaperEditEntries { $0.dailyID == dailyID }
@@ -349,7 +376,18 @@ final class ProjectController: ObservableObject {
     /// `rootURL` are always set/cleared together in `open`/`createNew`/`close`), and every caller
     /// already has a `ProjectFolder` in hand from iterating `metadata.folders`.
     func mediaURL(for daily: Daily, in folder: ProjectFolder) -> URL {
-        rootURL!.appendingPathComponent(folder.name).appendingPathComponent(daily.mediaFilename)
+        if let linkedSourcePath = daily.linkedSourcePath {
+            return URL(fileURLWithPath: linkedSourcePath)
+        }
+        return rootURL!.appendingPathComponent(folder.name).appendingPathComponent(daily.mediaFilename)
+    }
+
+    /// Whether a Daily's media can actually be found on disk right now — a linked Daily's source
+    /// file can vanish at any time (moved, renamed, deleted, external drive unmounted) since it's
+    /// no longer owned by the project. Callers check this before `playback.load`/transcribing so a
+    /// missing link surfaces as a clear message instead of a silent no-op or crash (spec §8).
+    func mediaExists(for daily: Daily, in folder: ProjectFolder) -> Bool {
+        FileManager.default.fileExists(atPath: mediaURL(for: daily, in: folder).path)
     }
 
     // MARK: - Paper Edit (spec §8: the assembled "selects" reel)

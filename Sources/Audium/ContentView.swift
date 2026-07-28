@@ -147,17 +147,17 @@ struct ContentView: View {
 
     private func handleDrop(providers: [NSItemProvider]) -> Bool {
         guard let provider = providers.first else { return false }
-        provider.loadFileRepresentation(forTypeIdentifier: UTType.audiovisualContent.identifier) { url, _ in
+        // `loadInPlaceFileRepresentation`, not `loadFileRepresentation` (spec §8, "always link to
+        // source media" — supersedes the old copy-based model this used to serve). Apple's docs
+        // for `loadFileRepresentation` say it vends a *temporary* copy of the dropped file that's
+        // no longer guaranteed to exist once the completion handler returns — fine when the next
+        // step copied it again into the project folder anyway, but linking `Daily.linkedSourcePath`
+        // straight to that ephemeral copy would point at a file that can vanish at any time instead
+        // of the user's real source. `loadInPlaceFileRepresentation` (macOS 11+) hands back the
+        // dropped file's actual on-disk location for a local Finder drag instead of copying it.
+        provider.loadInPlaceFileRepresentation(forTypeIdentifier: UTType.audiovisualContent.identifier) { url, _, _ in
             guard let url else { return }
-            // The URL is only valid for the duration of this callback — copy it out
-            // before handing off to the (async, longer-lived) transcription task. The copy lives
-            // in its own UUID-named subdirectory (rather than being renamed to a UUID itself) so
-            // the original filename survives into Daily.displayName instead of showing a UUID.
-            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-            try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-            let localCopy = tempDir.appendingPathComponent(url.lastPathComponent)
-            try? FileManager.default.copyItem(at: url, to: localCopy)
-            Task { await ingest(localCopy) }
+            Task { await ingest(url) }
         }
         return true
     }
@@ -224,12 +224,22 @@ struct ContentView: View {
         currentDailyID = daily.id
         segments = daily.transcript.segments
         let url = project.mediaURL(for: daily, in: folder)
-        sourceAudioURL = url
-        playback.load(url: url)
-        status = daily.transcript.segments.isEmpty ? "No transcript yet" : "\(daily.transcript.segments.count) segments"
         statusFraction = nil
         isTranscribing = false
         transcriptionStartedAt = nil
+        // Linked media (spec §8) can vanish out from under the project at any time — moved,
+        // renamed, deleted, an external drive unmounted. Checked before `playback.load` so that
+        // shows a clear message instead of `AVAudioPlayer`'s init silently failing (`try?`) and
+        // leaving the panels looking like nothing happened.
+        guard project.mediaExists(for: daily, in: folder) else {
+            sourceAudioURL = nil
+            playback.reset()
+            status = "Linked file not found: \(url.path) — it may have been moved, renamed, or deleted."
+            return
+        }
+        sourceAudioURL = url
+        playback.load(url: url)
+        status = daily.transcript.segments.isEmpty ? "No transcript yet" : "\(daily.transcript.segments.count) segments"
     }
 
     /// Re-runs transcription against whatever's currently loaded (spec fix: manual retranscribe,

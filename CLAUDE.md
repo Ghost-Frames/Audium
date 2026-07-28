@@ -19,7 +19,21 @@ Global speaker rename (editing one segment's speaker label renames every segment
 label, matching how diarization groups them) is implemented and real-GUI-tested (2026-07-28). The
 AI Chat Roles library was re-culled against the strictly-filmmaking/podcast/journalism criterion
 (2026-07-28): 402 → 302 skill files (100 removed, ~25%) — see standing practice below for what the
-prior "0 removed" pass missed.
+prior "0 removed" pass missed. Dailies now **always link to source media, never copy**
+(`Daily.linkedSourcePath: String?`, nil only means a pre-change Daily that's still a real copy —
+not migrated, left as-is) — this app isn't sandboxed (no entitlements file, confirmed via
+`build.sh`'s ad-hoc/local-dev codesign), so a plain absolute path is used instead of a
+security-scoped bookmark. Caught and fixed a real bug during this session's GUI test:
+`ContentView.handleDrop`'s Finder-drag path used `loadFileRepresentation`, which Apple docs say
+vends a temporary copy invalid after the completion handler returns — under the old copy model
+that was harmless, under the new link model it linked straight to a `/var/folders/.../T/...`
+scratch file instead of the user's real file; fixed via `loadInPlaceFileRepresentation`. Also new:
+one global cache/render location for derived files (extracted audio, YouTube downloads,
+whisper.cpp format conversions) — `CacheSettings` (UserDefaults-backed, defaults to
+`~/Library/Caches/com.postproduction.Audium/`), overridable in Settings, same conceptual model as
+Avid's Media Cache. Full real-GUI-tested detail (link-not-copy disk verification, moved-file
+graceful-failure test, custom-cache-location derived-file verification, relaunch persistence) in
+spec.md §8's "Media linking (not copying) + global cache location" subsection.
 
 Always read `docs/spec.md` first, before investigating or changing anything. Check its
 "Known Issues" and "Resolved" sections (Section 5) before re-diagnosing something that may

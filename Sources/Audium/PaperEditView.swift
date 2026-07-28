@@ -32,6 +32,7 @@ struct PaperEditView: View {
     @State private var showingNewAlert = false
     @State private var newName = ""
     @State private var pendingDelete: PaperEdit?
+    @State private var missingMediaError: String?
 
     private var paperEdits: [PaperEdit] { project.metadata?.paperEdits ?? [] }
 
@@ -48,7 +49,7 @@ struct PaperEditView: View {
                     sidebar
                     Divider()
                     if let selectedPaperEdit {
-                        PaperEditEntriesView(project: project, playback: playback, paperEdit: selectedPaperEdit)
+                        PaperEditEntriesView(project: project, playback: playback, paperEdit: selectedPaperEdit, missingMediaError: $missingMediaError)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
                         emptyState("No Paper Edit yet — create one, then add highlights to it from the Transcript panel's ★ list.")
@@ -59,6 +60,11 @@ struct PaperEditView: View {
         }
         .background(Theme.background)
         .frame(minWidth: 520, minHeight: 400)
+        .alert("File Not Found", isPresented: Binding(get: { missingMediaError != nil }, set: { if !$0 { missingMediaError = nil } })) {
+            Button("OK", role: .cancel) { missingMediaError = nil }
+        } message: {
+            Text(missingMediaError ?? "")
+        }
     }
 
     private var sidebar: some View {
@@ -145,6 +151,7 @@ private struct PaperEditEntriesView: View {
     @ObservedObject var project: ProjectController
     @ObservedObject var playback: AudioPlaybackController
     let paperEdit: PaperEdit
+    @Binding var missingMediaError: String?
 
     /// Entries whose Highlight/Daily still resolve — `removeHighlight`/`deleteDaily`/
     /// `deleteFolder` all cascade-clean dangling entries already, so a `nil` here would only mean
@@ -213,6 +220,14 @@ private struct PaperEditEntriesView: View {
     /// goes through, just triggered from here instead, then starts playback since the point of
     /// clicking a Paper Edit entry is to *hear* it, not just load it paused.
     private func play(_ item: ResolvedEntry) {
+        // Linked media (spec §8) can vanish out from under the project — checked here for the
+        // same reason `ContentView.loadDaily` checks it, so a moved/deleted source file surfaces
+        // as a clear alert instead of `playback.load` silently doing nothing.
+        guard project.mediaExists(for: item.daily, in: item.folder) else {
+            let url = project.mediaURL(for: item.daily, in: item.folder)
+            missingMediaError = "Linked file not found for \"\(item.daily.displayName)\": \(url.path) — it may have been moved, renamed, or deleted."
+            return
+        }
         let url = project.mediaURL(for: item.daily, in: item.folder)
         playback.load(url: url)
         playback.seek(to: item.start)

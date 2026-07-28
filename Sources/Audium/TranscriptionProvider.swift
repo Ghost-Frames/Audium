@@ -158,7 +158,9 @@ func extractedAudioURL(from url: URL) async throws -> URL {
     guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
         throw TranscriptionError.unsupportedAudioFormat(url.pathExtension)
     }
-    let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".m4a")
+    // Derived file, not system temp — writes into the configured global cache location (spec §8,
+    // "one global cache/render location", same conceptual model as Avid's Media Cache setting).
+    let outputURL = try CacheSettings.freshWorkDirectory().appendingPathComponent("audio.m4a")
     export.outputURL = outputURL
     export.outputFileType = .m4a
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
