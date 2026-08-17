@@ -1095,13 +1095,6 @@ private struct WaveformPanel: View {
                 Text(formatTime(playback.duration))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
-                // Manual re-transcribe (spec fix: a bad first pass or a provider/model change
-                // shouldn't require re-dropping the file) — reruns against the already-loaded URL.
-                Button("Re-transcribe") { onRetranscribe() }
-                    .font(.caption.bold())
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Theme.accent)
-                    .disabled(isBusy)
                 Spacer()
                 if isBusy {
                     if let batchProgress {
@@ -1113,6 +1106,20 @@ private struct WaveformPanel: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                // Manual re-transcribe (spec fix: a bad first pass or a provider/model change
+                // shouldn't require re-dropping the file) — reruns against the already-loaded URL.
+                // Right-aligned (spec fix, real UI bug not just a testing artifact): the Transcript
+                // panel directly below floats its "Add Highlight" bar at whatever x-coordinate a
+                // selection starts at, which is almost always left-margin-ish since that's where
+                // reading (and so dragging) naturally starts — a left-clustered Re-transcribe here
+                // shared that same x-zone across the panel boundary, close enough on screen to
+                // cause real mis-clicks, not just an automation artifact. Pinning it to the row's
+                // trailing edge puts it in a zone no left-starting selection's floating bar reaches.
+                Button("Re-transcribe") { onRetranscribe() }
+                    .font(.caption.bold())
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Theme.accent)
+                    .disabled(isBusy)
             }
         }
     }

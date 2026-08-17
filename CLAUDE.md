@@ -292,3 +292,17 @@ established for the OS-protected cases (`NSSavePanel`/`NSOpenPanel`, Finder-drag
 drag-to-reorder, `SecureField` entry) to ordinary clicks and navigation too. Reserve actual GUI
 automation for cases where it's genuinely faster/more reliable than asking the user — rare — not
 as the default approach.
+
+**Follow-up (same day): fixed the Re-transcribe/floating-bar x-coordinate collision** flagged as a
+known gap in the word-level-timestamps work above — `WaveformPanel`'s "Re-transcribe" moved to its
+row's trailing edge, away from where the Transcript panel's floating "Add Highlight" bar lands for a
+left-starting selection (spec.md's "Word-level timestamps..." section, new subsection, has the full
+detail). **New environment finding**: when this session's shell is SSH-attached rather than a local
+Terminal window, `screencapture`/`CGDisplayCreateImage` cannot reach the console session's screen
+buffer at all (a macOS session-separation limit, not a fixable Accessibility/Screen-Recording
+permission) — `osascript`/System Events UI scripting still works fine over SSH once Accessibility is
+granted, so AXPress/AX-attribute reads remain usable for verification even when screenshots aren't;
+confirmed the reposition fix via `AXSelectedText`/element-position reads instead of a screenshot for
+exactly this reason. Also reconfirmed (independently, in this follow-up session) that the
+prefix-region selection gap noted in spec.md is a real, reproducible rendering bug, not a one-off —
+still open for a future fix pass.

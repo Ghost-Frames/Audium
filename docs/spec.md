@@ -2008,14 +2008,38 @@ model:
 live, a cross-word selection that happened to *start* inside a segment's `[mm:ss] Speaker:` prefix
 region did not show the floating action bar at all (as opposed to the wrong-anchor bug above, which
 *did* show a bar, just with a wrong range) — real accessibility-text confirmed a genuine non-empty
-NSTextView selection existed at the time. Not conclusively root-caused: most of this session's
-apparent "the Add Highlight button doesn't respond" incidents turned out to be a testing-methodology
-artifact (this app's Waveform-panel "Re-transcribe" link and the Transcript-panel floating bar's
-"Add Highlight" button coincidentally sit at nearly the same x-coordinate in different panels,
-causing repeated mis-clicks during this session's `cliclick`/AXPress testing — not a real button
-failure), and this specific case may be the same artifact rather than a genuine rendering bug.
-Flagged honestly rather than claimed fixed; worth a focused human-at-the-mouse re-check in a future
-session before considering Stage 3 fully closed on this specific edge case.
+NSTextView selection existed at the time. **Reproduced again in a follow-up session** (same method:
+`AXSelectedText` read back a real selection, `["eaker 0: Can you hear"]`, starting mid-prefix), so
+this is a real rendering gap, not a one-off — still not root-caused or fixed. When a selection's
+start boundary falls in the prefix/separator region (no `FlowUnit` covers it) and it's also the
+*first* segment in the transcript, `TranscriptFlowView.Coordinator`'s start-boundary fallback has no
+prior unit to land on and the guard silently reports `nil`, hiding the bar entirely — plausible root
+cause, not yet confirmed by reading the fallback code against this specific case. Worth a focused
+fix in a future session rather than further live-testing churn.
+
+**Waveform-panel "Re-transcribe"/Transcript-panel floating-bar x-coordinate collision — fixed**
+(follow-up session): `WaveformPanel`'s "Re-transcribe" button (`ContentView.swift`) moved from
+directly after the `00:00 / 03:47` duration text to the row's trailing edge (after the `Spacer()`),
+clearing it from the x-coordinate zone a left-starting text selection's floating "Add Highlight" bar
+typically lands in — the two are in different panels but were previously close enough on screen to
+cause the repeated mis-clicks described above. **Verified via direct AX-attribute readout** (not a
+screenshot — this follow-up session ran over SSH, where `screencapture`/`CGDisplayCreateImage`
+cannot reach the console session's screen buffer, a macOS session-separation limit distinct from an
+Accessibility/Screen-Recording permission problem; confirmed by isolating that `osascript`/System
+Events UI scripting worked fine over the same SSH session once Accessibility was re-granted, while
+`screencapture` kept failing regardless): `Re-transcribe` now reads at `x=925`, the floating
+"Add Highlight" bar for a first-line selection at `x=631` — clearly separated, and the button was
+confirmed still functional (a fresh `AXPress` immediately after relaunch produced a real
+`AXSelectedText` selection on the transcript, proving the underlying selection/highlight pipeline is
+unaffected by the reposition). Live re-selection testing became unreliable partway through this same
+follow-up session (the first post-relaunch drag registered correctly; several subsequent
+`cliclick` drags from the same coordinates did not, despite Audium staying the frontmost process per
+`osascript`) — treated as the same kind of synthetic-input flakiness this file's other permanent
+notes already document for this app (`List` drag-to-reorder, `NSSavePanel`, delete-confirmation
+dialogs), not a regression, since nothing in this fix touches selection-handling code. The right-click
+context-menu fallback remains **not independently live-confirmed** across both sessions now — no
+active selection existed at the one right-click attempt this follow-up session made, so it's still
+an open item for a future human-at-the-mouse pass, same as before.
 
 ### AI Chat header overflow bug — fixed (2026-07-23)
 
